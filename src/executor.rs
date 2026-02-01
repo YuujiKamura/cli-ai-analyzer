@@ -1,4 +1,4 @@
-//! Gemini CLI executor
+//! AI CLI executor (Gemini, Claude, Ollama)
 
 use std::fs;
 use std::path::Path;
@@ -7,6 +7,7 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+use crate::backend::Backend;
 use crate::error::{Error, Result};
 
 /// Windows flag to hide console window
@@ -31,9 +32,9 @@ impl OutputFormat {
     }
 }
 
-/// Request parameters for Gemini CLI
+/// Request parameters for AI CLI
 #[derive(Debug)]
-pub struct GeminiRequest<'a> {
+pub struct AiRequest<'a> {
     /// The prompt to send
     pub prompt: &'a str,
     /// The model to use
@@ -42,88 +43,138 @@ pub struct GeminiRequest<'a> {
     pub files: Option<&'a [String]>,
     /// Output format
     pub output_format: OutputFormat,
+    /// Backend to use
+    pub backend: Backend,
 }
 
-impl<'a> GeminiRequest<'a> {
-    /// Create a text request without files
+/// Alias for backward compatibility
+pub type GeminiRequest<'a> = AiRequest<'a>;
+
+impl<'a> AiRequest<'a> {
+    /// Create a text request without files (defaults to Gemini)
     pub fn text(prompt: &'a str, model: &'a str) -> Self {
         Self {
             prompt,
             model,
             files: None,
             output_format: OutputFormat::Text,
+            backend: Backend::Gemini,
         }
     }
 
-    /// Create a text request with files
+    /// Create a text request with files (defaults to Gemini)
     pub fn text_with_files(prompt: &'a str, model: &'a str, files: &'a [String]) -> Self {
         Self {
             prompt,
             model,
             files: Some(files),
             output_format: OutputFormat::Text,
+            backend: Backend::Gemini,
         }
     }
 
-    /// Create a JSON request without files
+    /// Create a JSON request without files (defaults to Gemini)
     pub fn json(prompt: &'a str, model: &'a str) -> Self {
         Self {
             prompt,
             model,
             files: None,
             output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
         }
     }
 
-    /// Create a JSON request with files
+    /// Create a JSON request with files (defaults to Gemini)
     pub fn json_with_files(prompt: &'a str, model: &'a str, files: &'a [String]) -> Self {
         Self {
             prompt,
             model,
             files: Some(files),
             output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
         }
+    }
+
+    /// Set the backend to use
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
-/// Get the Gemini CLI path
-pub fn gemini_cmd_path(custom_path: Option<&str>) -> String {
+/// Get the CLI path for the specified backend
+pub fn cli_cmd_path(backend: Backend, custom_path: Option<&str>) -> String {
     // Custom path takes priority
     if let Some(path) = custom_path {
         return path.to_string();
     }
 
-    // Environment variable
-    if let Ok(path) = std::env::var("GEMINI_CMD_PATH") {
+    // Environment variable based on backend
+    let env_var = match backend {
+        Backend::Gemini => "GEMINI_CMD_PATH",
+        Backend::Claude => "CLAUDE_CMD_PATH",
+        Backend::Ollama => "OLLAMA_CMD_PATH",
+    };
+
+    if let Ok(path) = std::env::var(env_var) {
         return path;
     }
 
     // OS default
     if cfg!(target_os = "windows") {
-        "gemini.cmd".to_string()
+        backend.windows_command().to_string()
     } else {
-        "gemini".to_string()
+        backend.command().to_string()
     }
 }
 
-/// Run Gemini CLI with the given request
+/// Get the Gemini CLI path (backward compatibility)
+pub fn gemini_cmd_path(custom_path: Option<&str>) -> String {
+    cli_cmd_path(Backend::Gemini, custom_path)
+}
+
+/// Run AI CLI with the given request
+pub fn run_ai(
+    work_dir: &Path,
+    request: &AiRequest<'_>,
+    custom_cli_path: Option<&str>,
+) -> Result<String> {
+    let cli_path = cli_cmd_path(request.backend, custom_cli_path);
+
+    // Build and execute script based on backend
+    match request.backend {
+        Backend::Gemini => {
+            // Write prompt to file for Gemini (uses stdin)
+            let prompt_file = work_dir.join("prompt.txt");
+            fs::write(&prompt_file, request.prompt)?;
+
+            if cfg!(target_os = "windows") {
+                run_gemini_windows(work_dir, &cli_path, request)
+            } else {
+                run_gemini_unix(work_dir, &cli_path, request)
+            }
+        }
+        Backend::Claude => {
+            // Claude uses -p flag for prompt
+            if cfg!(target_os = "windows") {
+                run_claude_windows(work_dir, &cli_path, request)
+            } else {
+                run_claude_unix(work_dir, &cli_path, request)
+            }
+        }
+        Backend::Ollama => {
+            Err(Error::GeminiError("Ollama backend is not yet implemented".to_string()))
+        }
+    }
+}
+
+/// Run Gemini CLI with the given request (backward compatibility)
 pub fn run_gemini(
     work_dir: &Path,
     request: &GeminiRequest<'_>,
     custom_gemini_path: Option<&str>,
 ) -> Result<String> {
-    // Write prompt to file
-    let prompt_file = work_dir.join("prompt.txt");
-    fs::write(&prompt_file, request.prompt)?;
-
-    let gemini_path = gemini_cmd_path(custom_gemini_path);
-
-    // Build and execute script
-    if cfg!(target_os = "windows") {
-        run_gemini_windows(work_dir, &gemini_path, request)
-    } else {
-        run_gemini_unix(work_dir, &gemini_path, request)
-    }
+    run_ai(work_dir, request, custom_gemini_path)
 }
 
 /// Run Gemini CLI on Windows using PowerShell
