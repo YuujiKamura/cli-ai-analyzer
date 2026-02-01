@@ -8,6 +8,8 @@ pub enum Backend {
     Gemini,
     /// Anthropic Claude CLI
     Claude,
+    /// OpenAI Codex CLI
+    Codex,
     /// Ollama (future use)
     Ollama,
 }
@@ -18,6 +20,7 @@ impl Backend {
         match self {
             Backend::Gemini => "gemini",
             Backend::Claude => "claude",
+            Backend::Codex => "codex",
             Backend::Ollama => "ollama",
         }
     }
@@ -27,6 +30,7 @@ impl Backend {
         match self {
             Backend::Gemini => "gemini.cmd",
             Backend::Claude => "claude.cmd",
+            Backend::Codex => "codex.cmd",
             Backend::Ollama => "ollama.exe",
         }
     }
@@ -36,6 +40,7 @@ impl Backend {
         match self {
             Backend::Gemini => "gemini-2.5-flash",
             Backend::Claude => "claude-sonnet-4-20250514",
+            Backend::Codex => "gpt-4.1",
             Backend::Ollama => "llama3",
         }
     }
@@ -46,6 +51,7 @@ impl std::fmt::Display for Backend {
         match self {
             Backend::Gemini => write!(f, "Gemini"),
             Backend::Claude => write!(f, "Claude"),
+            Backend::Codex => write!(f, "Codex"),
             Backend::Ollama => write!(f, "Ollama"),
         }
     }
@@ -65,6 +71,7 @@ mod tests {
     fn test_backend_command() {
         assert_eq!(Backend::Gemini.command(), "gemini");
         assert_eq!(Backend::Claude.command(), "claude");
+        assert_eq!(Backend::Codex.command(), "codex");
         assert_eq!(Backend::Ollama.command(), "ollama");
     }
 
@@ -72,6 +79,7 @@ mod tests {
     fn test_backend_windows_command() {
         assert_eq!(Backend::Gemini.windows_command(), "gemini.cmd");
         assert_eq!(Backend::Claude.windows_command(), "claude.cmd");
+        assert_eq!(Backend::Codex.windows_command(), "codex.cmd");
         assert_eq!(Backend::Ollama.windows_command(), "ollama.exe");
     }
 
@@ -79,6 +87,7 @@ mod tests {
     fn test_backend_default_model() {
         assert_eq!(Backend::Gemini.default_model(), "gemini-2.5-flash");
         assert_eq!(Backend::Claude.default_model(), "claude-sonnet-4-20250514");
+        assert_eq!(Backend::Codex.default_model(), "gpt-4.1");
         assert_eq!(Backend::Ollama.default_model(), "llama3");
     }
 
@@ -86,6 +95,7 @@ mod tests {
     fn test_backend_display() {
         assert_eq!(format!("{}", Backend::Gemini), "Gemini");
         assert_eq!(format!("{}", Backend::Claude), "Claude");
+        assert_eq!(format!("{}", Backend::Codex), "Codex");
         assert_eq!(format!("{}", Backend::Ollama), "Ollama");
     }
 }

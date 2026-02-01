@@ -113,6 +113,7 @@ pub fn cli_cmd_path(backend: Backend, custom_path: Option<&str>) -> String {
     let env_var = match backend {
         Backend::Gemini => "GEMINI_CMD_PATH",
         Backend::Claude => "CLAUDE_CMD_PATH",
+        Backend::Codex => "CODEX_CMD_PATH",
         Backend::Ollama => "OLLAMA_CMD_PATH",
     };
 
@@ -161,6 +162,14 @@ pub fn run_ai(
                 run_claude_windows(work_dir, &cli_path, request)
             } else {
                 run_claude_unix(work_dir, &cli_path, request)
+            }
+        }
+        Backend::Codex => {
+            // Codex uses exec subcommand with prompt as argument
+            if cfg!(target_os = "windows") {
+                run_codex_windows(work_dir, &cli_path, request)
+            } else {
+                run_codex_unix(work_dir, &cli_path, request)
             }
         }
         Backend::Ollama => {
@@ -442,6 +451,122 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
     }
 }
 
+/// Run Codex CLI on Windows using PowerShell
+fn run_codex_windows(
+    work_dir: &Path,
+    codex_path: &str,
+    request: &AiRequest<'_>,
+) -> Result<String> {
+    let ps_script = build_codex_ps_script(codex_path, request);
+    let script_file = work_dir.join("run.ps1");
+    fs::write(&script_file, &ps_script)?;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script_file.to_string_lossy(),
+    ])
+    .current_dir(work_dir);
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    execute_command(cmd, work_dir)
+}
+
+/// Run Codex CLI on Unix systems
+fn run_codex_unix(
+    work_dir: &Path,
+    codex_path: &str,
+    request: &AiRequest<'_>,
+) -> Result<String> {
+    let shell_script = build_codex_shell_script(codex_path, request);
+    let script_file = work_dir.join("run.sh");
+    fs::write(&script_file, &shell_script)?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_file)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_file, perms)?;
+    }
+
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script_file).current_dir(work_dir);
+
+    execute_command(cmd, work_dir)
+}
+
+/// Build PowerShell script for Codex on Windows
+/// Codex CLI format: codex exec -m model "prompt" [-i file1 file2...]
+fn build_codex_ps_script(codex_path: &str, request: &AiRequest<'_>) -> String {
+    let codex_path = codex_path.replace('\'', "''");
+    let model = request.model;
+    let prompt = request.prompt.replace('\'', "''").replace('`', "``");
+
+    let mut script = format!(
+        r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+"#
+    );
+
+    // Build the command with arguments
+    // Codex uses -i for images, but we'll use it for file attachments
+    if let Some(files) = request.files {
+        let file_args = files
+            .iter()
+            .map(|f| format!("-i '{}'", f.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        script.push_str(&format!(
+            r#"& '{}' exec -m {} {} '{}'
+"#,
+            codex_path, model, file_args, prompt
+        ));
+    } else {
+        script.push_str(&format!(
+            r#"& '{}' exec -m {} '{}'
+"#,
+            codex_path, model, prompt
+        ));
+    }
+
+    script
+}
+
+/// Build shell script for Codex on Unix
+/// Codex CLI format: codex exec -m model "prompt" [-i file1 file2...]
+fn build_codex_shell_script(codex_path: &str, request: &AiRequest<'_>) -> String {
+    let model = request.model;
+    let prompt = request.prompt.replace('\'', "'\\''");
+
+    if let Some(files) = request.files {
+        let file_args = files
+            .iter()
+            .map(|f| format!("-i '{}'", f.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"#!/bin/bash
+'{}' exec -m {} {} '{}'
+"#,
+            codex_path, model, file_args, prompt
+        )
+    } else {
+        format!(
+            r#"#!/bin/bash
+'{}' exec -m {} '{}'
+"#,
+            codex_path, model, prompt
+        )
+    }
+}
+
 /// Clean AI output by removing noise
 pub fn clean_ai_output(output: &str) -> String {
     output
@@ -585,5 +710,48 @@ mod tests {
         assert!(script.contains("--files"));
         assert!(script.contains("'doc.pdf'"));
         assert!(script.contains("'image.png'"));
+    }
+
+    #[test]
+    fn test_cli_cmd_path_codex_default() {
+        let path = cli_cmd_path(Backend::Codex, None);
+        if cfg!(target_os = "windows") {
+            assert_eq!(path, "codex.cmd");
+        } else {
+            assert_eq!(path, "codex");
+        }
+    }
+
+    #[test]
+    fn test_build_codex_shell_script_no_files() {
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "gpt-4.1",
+            files: None,
+            output_format: OutputFormat::Text,
+            backend: Backend::Codex,
+        };
+        let script = build_codex_shell_script("codex", &req);
+        assert!(script.contains("codex"));
+        assert!(script.contains("exec"));
+        assert!(script.contains("-m gpt-4.1"));
+        assert!(script.contains("'test prompt'"));
+        assert!(!script.contains("-i"));
+    }
+
+    #[test]
+    fn test_build_codex_shell_script_with_files() {
+        let files = vec!["doc.pdf".to_string(), "image.png".to_string()];
+        let req = AiRequest {
+            prompt: "analyze these",
+            model: "gpt-4.1",
+            files: Some(&files),
+            output_format: OutputFormat::Text,
+            backend: Backend::Codex,
+        };
+        let script = build_codex_shell_script("codex", &req);
+        assert!(script.contains("exec"));
+        assert!(script.contains("-i 'doc.pdf'"));
+        assert!(script.contains("-i 'image.png'"));
     }
 }
