@@ -1,20 +1,20 @@
 [package]
-name = "gemini-analyzer"
+name = "cli-ai-analyzer"
 version = "0.1.0"
 edition = "2021"
 description = "A universal AI analysis library and CLI powered by Gemini CLI"
 authors = ["yuuji"]
 license = "MIT"
-repository = "https://github.com/yuuji/gemini-analyzer"
+repository = "https://github.com/YuujiKamura/cli-ai-analyzer"
 keywords = ["gemini", "ai", "analysis", "pdf", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 
 [lib]
-name = "gemini_analyzer"
+name = "cli_ai_analyzer"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gemini-analyzer"
+name = "cli-ai-analyzer"
 path = "src/main.rs"
 
 [dependencies]
