@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example basic -- document.pdf
 
-use gemini_analyzer::{analyze, prompt, AnalysisBuilder, AnalyzeOptions};
+use cli_ai_analyzer::{analyze, prompt, AnalysisBuilder, AnalyzeOptions, Backend};
 use std::env;
 use std::path::PathBuf;
 
@@ -50,5 +50,18 @@ fn main() {
             println!("{}", result);
         }
         Err(e) => eprintln!("Error: {}", e),
+    }
+
+    // Method 3: Using Claude backend
+    match AnalysisBuilder::new("この書類を要約してください。")
+        .file(&file)
+        .backend(Backend::Claude)
+        .run()
+    {
+        Ok(result) => {
+            println!("\n--- Result (Claude) ---");
+            println!("{}", result);
+        }
+        Err(e) => eprintln!("Error (Claude): {}", e),
     }
 }

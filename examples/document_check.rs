@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example document_check -- document.pdf
 
-use gemini_analyzer::{analyze, AnalyzeOptions};
+use cli_ai_analyzer::{analyze, AnalyzeOptions};
 use std::env;
 use std::path::PathBuf;
 

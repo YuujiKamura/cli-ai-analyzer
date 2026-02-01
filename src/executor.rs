@@ -129,6 +129,7 @@ pub fn cli_cmd_path(backend: Backend, custom_path: Option<&str>) -> String {
 }
 
 /// Get the Gemini CLI path (backward compatibility)
+#[allow(dead_code)]
 pub fn gemini_cmd_path(custom_path: Option<&str>) -> String {
     cli_cmd_path(Backend::Gemini, custom_path)
 }
@@ -169,6 +170,7 @@ pub fn run_ai(
 }
 
 /// Run Gemini CLI with the given request (backward compatibility)
+#[allow(dead_code)]
 pub fn run_gemini(
     work_dir: &Path,
     request: &GeminiRequest<'_>,
@@ -234,7 +236,7 @@ fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
 
     if output.status.success() {
         let result = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(clean_gemini_output(&result))
+        Ok(clean_ai_output(&result))
     } else {
         let status = output
             .status
@@ -323,16 +325,142 @@ cat prompt.txt | '{}' -m {} -o {}
     }
 }
 
-/// Clean Gemini output by removing noise
-pub fn clean_gemini_output(output: &str) -> String {
+/// Run Claude CLI on Windows using PowerShell
+fn run_claude_windows(
+    work_dir: &Path,
+    claude_path: &str,
+    request: &AiRequest<'_>,
+) -> Result<String> {
+    let ps_script = build_claude_ps_script(claude_path, request);
+    let script_file = work_dir.join("run.ps1");
+    fs::write(&script_file, &ps_script)?;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script_file.to_string_lossy(),
+    ])
+    .current_dir(work_dir);
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    execute_command(cmd, work_dir)
+}
+
+/// Run Claude CLI on Unix systems
+fn run_claude_unix(
+    work_dir: &Path,
+    claude_path: &str,
+    request: &AiRequest<'_>,
+) -> Result<String> {
+    let shell_script = build_claude_shell_script(claude_path, request);
+    let script_file = work_dir.join("run.sh");
+    fs::write(&script_file, &shell_script)?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_file)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_file, perms)?;
+    }
+
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script_file).current_dir(work_dir);
+
+    execute_command(cmd, work_dir)
+}
+
+/// Build PowerShell script for Claude on Windows
+/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--files file1 file2...]
+fn build_claude_ps_script(claude_path: &str, request: &AiRequest<'_>) -> String {
+    let claude_path = claude_path.replace('\'', "''");
+    let model = request.model;
+    let prompt = request.prompt.replace('\'', "''").replace('`', "``");
+
+    // Build base command
+    let mut script = format!(
+        r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+"#
+    );
+
+    // Build the command with arguments
+    if let Some(files) = request.files {
+        let file_array = files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        script.push_str(&format!(
+            r#"$files = @({})
+& '{}' -p '{}' --model {} --output-format text --files $files
+"#,
+            file_array, claude_path, prompt, model
+        ));
+    } else {
+        script.push_str(&format!(
+            r#"& '{}' -p '{}' --model {} --output-format text
+"#,
+            claude_path, prompt, model
+        ));
+    }
+
+    script
+}
+
+/// Build shell script for Claude on Unix
+/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--files file1 file2...]
+fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> String {
+    let model = request.model;
+    let prompt = request.prompt.replace('\'', "'\\''");
+
+    if let Some(files) = request.files {
+        let file_args = files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"#!/bin/bash
+'{}' -p '{}' --model {} --output-format text --files {}
+"#,
+            claude_path, prompt, model, file_args
+        )
+    } else {
+        format!(
+            r#"#!/bin/bash
+'{}' -p '{}' --model {} --output-format text
+"#,
+            claude_path, prompt, model
+        )
+    }
+}
+
+/// Clean AI output by removing noise
+pub fn clean_ai_output(output: &str) -> String {
     output
         .lines()
         .filter(|line| {
+            // Gemini noise
             !line.contains("Loaded cached credentials")
                 && !line.contains("Hook registry initialized")
+                // Claude noise (if any)
+                && !line.starts_with("Loading")
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Alias for backward compatibility
+#[allow(dead_code)]
+pub fn clean_gemini_output(output: &str) -> String {
+    clean_ai_output(output)
 }
 
 /// Write error log for debugging
@@ -347,26 +475,67 @@ mod tests {
 
     #[test]
     fn test_gemini_request_text() {
-        let req = GeminiRequest::text("test prompt", "gemini-2.5-flash");
+        let req = AiRequest::text("test prompt", "gemini-2.5-flash");
         assert_eq!(req.prompt, "test prompt");
         assert_eq!(req.model, "gemini-2.5-flash");
         assert!(req.files.is_none());
         assert_eq!(req.output_format, OutputFormat::Text);
+        assert_eq!(req.backend, Backend::Gemini);
     }
 
     #[test]
     fn test_gemini_request_json_with_files() {
         let files = vec!["a.pdf".to_string(), "b.pdf".to_string()];
-        let req = GeminiRequest::json_with_files("test", "gemini-2.5-flash", &files);
+        let req = AiRequest::json_with_files("test", "gemini-2.5-flash", &files);
         assert!(req.files.is_some());
         assert_eq!(req.output_format, OutputFormat::Json);
     }
 
     #[test]
-    fn test_clean_gemini_output() {
+    fn test_ai_request_with_backend() {
+        let req = AiRequest::text("test", "claude-sonnet-4-20250514")
+            .with_backend(Backend::Claude);
+        assert_eq!(req.backend, Backend::Claude);
+    }
+
+    #[test]
+    fn test_clean_ai_output() {
         let output = "Loaded cached credentials\nActual content\nHook registry initialized\nMore content";
-        let cleaned = clean_gemini_output(output);
+        let cleaned = clean_ai_output(output);
         assert_eq!(cleaned, "Actual content\nMore content");
+    }
+
+    #[test]
+    fn test_clean_gemini_output_alias() {
+        let output = "Loaded cached credentials\nActual content";
+        let cleaned = clean_gemini_output(output);
+        assert_eq!(cleaned, "Actual content");
+    }
+
+    #[test]
+    fn test_cli_cmd_path_gemini_default() {
+        let path = cli_cmd_path(Backend::Gemini, None);
+        if cfg!(target_os = "windows") {
+            assert_eq!(path, "gemini.cmd");
+        } else {
+            assert_eq!(path, "gemini");
+        }
+    }
+
+    #[test]
+    fn test_cli_cmd_path_claude_default() {
+        let path = cli_cmd_path(Backend::Claude, None);
+        if cfg!(target_os = "windows") {
+            assert_eq!(path, "claude.cmd");
+        } else {
+            assert_eq!(path, "claude");
+        }
+    }
+
+    #[test]
+    fn test_cli_cmd_path_custom() {
+        let path = cli_cmd_path(Backend::Gemini, Some("/custom/gemini"));
+        assert_eq!(path, "/custom/gemini");
     }
 
     #[test]
@@ -383,5 +552,38 @@ mod tests {
     fn test_gemini_cmd_path_custom() {
         let path = gemini_cmd_path(Some("/custom/gemini"));
         assert_eq!(path, "/custom/gemini");
+    }
+
+    #[test]
+    fn test_build_claude_shell_script_no_files() {
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "claude-sonnet-4-20250514",
+            files: None,
+            output_format: OutputFormat::Text,
+            backend: Backend::Claude,
+        };
+        let script = build_claude_shell_script("claude", &req);
+        assert!(script.contains("claude"));
+        assert!(script.contains("-p 'test prompt'"));
+        assert!(script.contains("--model claude-sonnet-4-20250514"));
+        assert!(script.contains("--output-format text"));
+        assert!(!script.contains("--files"));
+    }
+
+    #[test]
+    fn test_build_claude_shell_script_with_files() {
+        let files = vec!["doc.pdf".to_string(), "image.png".to_string()];
+        let req = AiRequest {
+            prompt: "analyze these",
+            model: "claude-sonnet-4-20250514",
+            files: Some(&files),
+            output_format: OutputFormat::Text,
+            backend: Backend::Claude,
+        };
+        let script = build_claude_shell_script("claude", &req);
+        assert!(script.contains("--files"));
+        assert!(script.contains("'doc.pdf'"));
+        assert!(script.contains("'image.png'"));
     }
 }

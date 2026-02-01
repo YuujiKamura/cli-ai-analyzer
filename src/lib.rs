@@ -1,50 +1,72 @@
-//! # gemini-analyzer
+//! # cli-ai-analyzer
 //!
-//! A universal AI analysis library powered by Gemini CLI.
+//! A universal AI analysis library supporting multiple AI CLI backends.
+//!
+//! ## Supported Backends
+//!
+//! - **Gemini** (default) - Google's Gemini CLI
+//! - **Claude** - Anthropic's Claude CLI
+//! - **Ollama** - Local LLM (planned)
 //!
 //! ## Features
 //!
 //! - File analysis (PDF, images, text)
 //! - Text-only prompts
 //! - Customizable models
+//! - Backend switching
 //! - Temporary directory management
 //!
 //! ## Example
 //!
 //! ```rust,no_run
-//! use gemini_analyzer::{analyze, AnalyzeOptions};
+//! use cli_ai_analyzer::{analyze, AnalyzeOptions, Backend};
 //! use std::path::PathBuf;
 //!
+//! // Using Gemini (default)
 //! let result = analyze(
 //!     "Describe this document",
 //!     &[PathBuf::from("document.pdf")],
 //!     AnalyzeOptions::default(),
 //! ).unwrap();
 //!
+//! // Using Claude
+//! let result = analyze(
+//!     "Describe this document",
+//!     &[PathBuf::from("document.pdf")],
+//!     AnalyzeOptions::default().with_backend(Backend::Claude),
+//! ).unwrap();
+//!
 //! println!("{}", result);
 //! ```
 
+mod backend;
 mod error;
 mod executor;
 mod temp;
 
+pub use backend::Backend;
 pub use error::{Error, Result};
-pub use executor::{GeminiRequest, OutputFormat};
+pub use executor::{AiRequest, GeminiRequest, OutputFormat};
 
 use std::path::Path;
 
 /// Default Gemini model
 pub const DEFAULT_MODEL: &str = "gemini-2.5-flash";
 
+/// Default Claude model
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
+
 /// Options for analysis
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
-    /// Gemini model to use
+    /// Model to use
     pub model: String,
     /// Output format (text or json)
     pub output_format: OutputFormat,
-    /// Custom Gemini CLI path (optional)
-    pub gemini_path: Option<String>,
+    /// Custom CLI path (optional)
+    pub cli_path: Option<String>,
+    /// Backend to use (Gemini, Claude, etc.)
+    pub backend: Backend,
 }
 
 impl Default for AnalyzeOptions {
@@ -52,7 +74,8 @@ impl Default for AnalyzeOptions {
         Self {
             model: DEFAULT_MODEL.to_string(),
             output_format: OutputFormat::Text,
-            gemini_path: None,
+            cli_path: None,
+            backend: Backend::default(),
         }
     }
 }
@@ -66,16 +89,38 @@ impl AnalyzeOptions {
         }
     }
 
+    /// Set the backend to use
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        // Update model to backend's default if using the old default
+        if self.model == DEFAULT_MODEL && backend != Backend::Gemini {
+            self.model = backend.default_model().to_string();
+        }
+        self.backend = backend;
+        self
+    }
+
     /// Set output format to JSON
     pub fn json(mut self) -> Self {
         self.output_format = OutputFormat::Json;
         self
     }
 
-    /// Set custom Gemini CLI path
-    pub fn with_gemini_path(mut self, path: impl Into<String>) -> Self {
-        self.gemini_path = Some(path.into());
+    /// Set custom CLI path
+    pub fn with_cli_path(mut self, path: impl Into<String>) -> Self {
+        self.cli_path = Some(path.into());
         self
+    }
+
+    /// Set custom Gemini CLI path (backward compatibility alias)
+    pub fn with_gemini_path(mut self, path: impl Into<String>) -> Self {
+        self.cli_path = Some(path.into());
+        self
+    }
+
+    /// Deprecated: Use cli_path instead
+    #[deprecated(since = "0.2.0", note = "Use cli_path field instead")]
+    pub fn gemini_path(&self) -> Option<&String> {
+        self.cli_path.as_ref()
     }
 }
 
@@ -94,7 +139,7 @@ impl AnalyzeOptions {
 /// # Example
 ///
 /// ```rust,no_run
-/// use gemini_analyzer::{analyze, AnalyzeOptions};
+/// use cli_ai_analyzer::{analyze, AnalyzeOptions};
 /// use std::path::PathBuf;
 ///
 /// let result = analyze(
@@ -108,7 +153,7 @@ pub fn analyze<P: AsRef<Path>>(
     files: &[P],
     options: AnalyzeOptions,
 ) -> Result<String> {
-    let temp_dir = temp::create_temp_dir("gemini-analyzer")?;
+    let temp_dir = temp::create_temp_dir("cli-ai-analyzer")?;
     let result = analyze_in_dir(&temp_dir, prompt, files, options);
     temp::cleanup_temp_dir(&temp_dir);
     result
@@ -118,7 +163,7 @@ pub fn analyze<P: AsRef<Path>>(
 ///
 /// # Arguments
 ///
-/// * `prompt` - The prompt to send to Gemini
+/// * `prompt` - The prompt to send to the AI backend
 /// * `options` - Analysis options
 ///
 /// # Returns
@@ -128,15 +173,22 @@ pub fn analyze<P: AsRef<Path>>(
 /// # Example
 ///
 /// ```rust,no_run
-/// use gemini_analyzer::{prompt, AnalyzeOptions};
+/// use cli_ai_analyzer::{prompt, AnalyzeOptions, Backend};
 ///
+/// // Using Gemini (default)
 /// let result = prompt(
 ///     "Explain the construction document verification process in Japanese",
 ///     AnalyzeOptions::default(),
 /// ).unwrap();
+///
+/// // Using Claude
+/// let result = prompt(
+///     "Explain the construction document verification process in Japanese",
+///     AnalyzeOptions::default().with_backend(Backend::Claude),
+/// ).unwrap();
 /// ```
 pub fn prompt(prompt: &str, options: AnalyzeOptions) -> Result<String> {
-    let temp_dir = temp::create_temp_dir("gemini-analyzer")?;
+    let temp_dir = temp::create_temp_dir("cli-ai-analyzer")?;
     let result = prompt_in_dir(&temp_dir, prompt, options);
     temp::cleanup_temp_dir(&temp_dir);
     result
@@ -164,26 +216,28 @@ pub fn analyze_in_dir<P: AsRef<Path>>(
         file_names.push(file_name);
     }
 
-    let request = GeminiRequest {
+    let request = AiRequest {
         prompt,
         model: &options.model,
         files: Some(&file_names),
         output_format: options.output_format,
+        backend: options.backend,
     };
 
-    executor::run_gemini(work_dir, &request, options.gemini_path.as_deref())
+    executor::run_ai(work_dir, &request, options.cli_path.as_deref())
 }
 
 /// Run a prompt without files in a specific directory
 pub fn prompt_in_dir(work_dir: &Path, prompt: &str, options: AnalyzeOptions) -> Result<String> {
-    let request = GeminiRequest {
+    let request = AiRequest {
         prompt,
         model: &options.model,
         files: None,
         output_format: options.output_format,
+        backend: options.backend,
     };
 
-    executor::run_gemini(work_dir, &request, options.gemini_path.as_deref())
+    executor::run_ai(work_dir, &request, options.cli_path.as_deref())
 }
 
 /// Builder for complex analysis requests
@@ -230,9 +284,21 @@ impl AnalysisBuilder {
         self
     }
 
-    /// Set custom Gemini CLI path
+    /// Set the backend to use
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.options = self.options.with_backend(backend);
+        self
+    }
+
+    /// Set custom CLI path
+    pub fn cli_path(mut self, path: impl Into<String>) -> Self {
+        self.options.cli_path = Some(path.into());
+        self
+    }
+
+    /// Set custom Gemini CLI path (backward compatibility alias)
     pub fn gemini_path(mut self, path: impl Into<String>) -> Self {
-        self.options.gemini_path = Some(path.into());
+        self.options.cli_path = Some(path.into());
         self
     }
 
@@ -255,17 +321,33 @@ mod tests {
         let opts = AnalyzeOptions::default();
         assert_eq!(opts.model, DEFAULT_MODEL);
         assert!(matches!(opts.output_format, OutputFormat::Text));
+        assert_eq!(opts.backend, Backend::Gemini);
     }
 
     #[test]
     fn test_analyze_options_builder() {
         let opts = AnalyzeOptions::with_model("gemini-2.0-flash-exp")
             .json()
-            .with_gemini_path("/custom/path");
+            .with_cli_path("/custom/path");
 
         assert_eq!(opts.model, "gemini-2.0-flash-exp");
         assert!(matches!(opts.output_format, OutputFormat::Json));
-        assert_eq!(opts.gemini_path, Some("/custom/path".to_string()));
+        assert_eq!(opts.cli_path, Some("/custom/path".to_string()));
+    }
+
+    #[test]
+    fn test_analyze_options_with_backend() {
+        let opts = AnalyzeOptions::default().with_backend(Backend::Claude);
+        assert_eq!(opts.backend, Backend::Claude);
+        assert_eq!(opts.model, DEFAULT_CLAUDE_MODEL);
+    }
+
+    #[test]
+    fn test_analyze_options_with_backend_custom_model() {
+        let opts = AnalyzeOptions::with_model("custom-model").with_backend(Backend::Claude);
+        assert_eq!(opts.backend, Backend::Claude);
+        // Custom model is preserved even with backend change
+        assert_eq!(opts.model, "custom-model");
     }
 
     #[test]
@@ -279,5 +361,14 @@ mod tests {
         assert_eq!(builder.prompt, "test prompt");
         assert_eq!(builder.files.len(), 2);
         assert_eq!(builder.options.model, "gemini-2.0-flash-exp");
+    }
+
+    #[test]
+    fn test_analysis_builder_with_backend() {
+        let builder = AnalysisBuilder::new("test prompt")
+            .backend(Backend::Claude);
+
+        assert_eq!(builder.options.backend, Backend::Claude);
+        assert_eq!(builder.options.model, DEFAULT_CLAUDE_MODEL);
     }
 }

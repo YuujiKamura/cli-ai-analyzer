@@ -1,38 +1,60 @@
-//! gemini-analyzer CLI
+//! cli-ai-analyzer CLI
 //!
-//! A command-line interface for AI analysis using Gemini CLI.
+//! A command-line interface for AI analysis using Gemini or Claude CLI.
 //!
 //! ## Usage
 //!
 //! ```bash
-//! # Analyze files with a prompt
-//! gemini-analyzer analyze --prompt "Describe this document" document.pdf
+//! # Analyze files with a prompt (using Gemini by default)
+//! cli-ai-analyzer analyze --prompt "Describe this document" document.pdf
+//!
+//! # Analyze using Claude
+//! cli-ai-analyzer analyze --prompt "Describe this document" --backend claude document.pdf
 //!
 //! # Analyze multiple files
-//! gemini-analyzer analyze --prompt "Compare these documents" doc1.pdf doc2.pdf
+//! cli-ai-analyzer analyze --prompt "Compare these documents" doc1.pdf doc2.pdf
 //!
 //! # Text-only prompt
-//! gemini-analyzer prompt "Explain construction document verification"
+//! cli-ai-analyzer prompt "Explain construction document verification"
 //!
 //! # Use a specific model
-//! gemini-analyzer analyze --prompt "..." --model gemini-2.0-flash-exp document.pdf
+//! cli-ai-analyzer analyze --prompt "..." --model gemini-2.0-flash-exp document.pdf
 //!
 //! # JSON output
-//! gemini-analyzer analyze --prompt "..." --json document.pdf
+//! cli-ai-analyzer analyze --prompt "..." --json document.pdf
 //! ```
 
-use clap::{Parser, Subcommand};
-use gemini_analyzer::{analyze, prompt, AnalyzeOptions, OutputFormat, DEFAULT_MODEL};
+use clap::{Parser, Subcommand, ValueEnum};
+use cli_ai_analyzer::{analyze, prompt, AnalyzeOptions, Backend, OutputFormat};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// CLI backend selection
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    /// Google Gemini CLI
+    Gemini,
+    /// Anthropic Claude CLI
+    Claude,
+}
+
+impl From<BackendArg> for Backend {
+    fn from(arg: BackendArg) -> Self {
+        match arg {
+            BackendArg::Gemini => Backend::Gemini,
+            BackendArg::Claude => Backend::Claude,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
-    name = "gemini-analyzer",
+    name = "cli-ai-analyzer",
     version,
-    about = "AI analysis CLI powered by Gemini",
-    long_about = "A universal AI analysis tool using Gemini CLI.\n\n\
-                  Supports PDF, image, and text file analysis with customizable prompts."
+    about = "AI analysis CLI powered by Gemini or Claude",
+    long_about = "A universal AI analysis tool using Gemini or Claude CLI.\n\n\
+                  Supports PDF, image, and text file analysis with customizable prompts.\n\n\
+                  Backends: gemini (default), claude"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,7 +66,7 @@ enum Commands {
     /// Analyze files with a prompt
     #[command(alias = "a")]
     Analyze {
-        /// The prompt to send to Gemini
+        /// The prompt to send to the AI
         #[arg(short, long)]
         prompt: String,
 
@@ -52,17 +74,21 @@ enum Commands {
         #[arg(required = true)]
         files: Vec<PathBuf>,
 
-        /// Gemini model to use
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// Model to use (default depends on backend)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Backend to use (gemini, claude)
+        #[arg(short, long, value_enum, default_value = "gemini")]
+        backend: BackendArg,
 
         /// Output in JSON format
         #[arg(long)]
         json: bool,
 
-        /// Custom Gemini CLI path
-        #[arg(long, env = "GEMINI_CMD_PATH")]
-        gemini_path: Option<String>,
+        /// Custom CLI path
+        #[arg(long)]
+        cli_path: Option<String>,
     },
 
     /// Send a text-only prompt (no files)
@@ -71,17 +97,21 @@ enum Commands {
         /// The prompt to send
         prompt: String,
 
-        /// Gemini model to use
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// Model to use (default depends on backend)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Backend to use (gemini, claude)
+        #[arg(short, long, value_enum, default_value = "gemini")]
+        backend: BackendArg,
 
         /// Output in JSON format
         #[arg(long)]
         json: bool,
 
-        /// Custom Gemini CLI path
-        #[arg(long, env = "GEMINI_CMD_PATH")]
-        gemini_path: Option<String>,
+        /// Custom CLI path
+        #[arg(long)]
+        cli_path: Option<String>,
     },
 
     /// Check files with a document verification prompt (Japanese)
@@ -95,13 +125,17 @@ enum Commands {
         #[arg(short, long)]
         instruction: Option<String>,
 
-        /// Gemini model to use
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// Model to use (default depends on backend)
+        #[arg(short, long)]
+        model: Option<String>,
 
-        /// Custom Gemini CLI path
-        #[arg(long, env = "GEMINI_CMD_PATH")]
-        gemini_path: Option<String>,
+        /// Backend to use (gemini, claude)
+        #[arg(short, long, value_enum, default_value = "gemini")]
+        backend: BackendArg,
+
+        /// Custom CLI path
+        #[arg(long)]
+        cli_path: Option<String>,
     },
 
     /// Compare multiple files for consistency
@@ -115,13 +149,17 @@ enum Commands {
         #[arg(short, long)]
         instruction: Option<String>,
 
-        /// Gemini model to use
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// Model to use (default depends on backend)
+        #[arg(short, long)]
+        model: Option<String>,
 
-        /// Custom Gemini CLI path
-        #[arg(long, env = "GEMINI_CMD_PATH")]
-        gemini_path: Option<String>,
+        /// Backend to use (gemini, claude)
+        #[arg(short, long, value_enum, default_value = "gemini")]
+        backend: BackendArg,
+
+        /// Custom CLI path
+        #[arg(long)]
+        cli_path: Option<String>,
     },
 }
 
@@ -133,8 +171,9 @@ fn main() -> ExitCode {
             prompt: prompt_text,
             files,
             model,
+            backend,
             json,
-            gemini_path,
+            cli_path,
         } => {
             // Validate files exist
             for file in &files {
@@ -144,12 +183,17 @@ fn main() -> ExitCode {
                 }
             }
 
-            let mut options = AnalyzeOptions::with_model(model);
+            let backend: Backend = backend.into();
+            let mut options = if let Some(m) = model {
+                AnalyzeOptions::with_model(m).with_backend(backend)
+            } else {
+                AnalyzeOptions::default().with_backend(backend)
+            };
             if json {
                 options.output_format = OutputFormat::Json;
             }
-            if let Some(path) = gemini_path {
-                options.gemini_path = Some(path);
+            if let Some(path) = cli_path {
+                options.cli_path = Some(path);
             }
 
             analyze(&prompt_text, &files, options)
@@ -158,15 +202,21 @@ fn main() -> ExitCode {
         Commands::Prompt {
             prompt: prompt_text,
             model,
+            backend,
             json,
-            gemini_path,
+            cli_path,
         } => {
-            let mut options = AnalyzeOptions::with_model(model);
+            let backend: Backend = backend.into();
+            let mut options = if let Some(m) = model {
+                AnalyzeOptions::with_model(m).with_backend(backend)
+            } else {
+                AnalyzeOptions::default().with_backend(backend)
+            };
             if json {
                 options.output_format = OutputFormat::Json;
             }
-            if let Some(path) = gemini_path {
-                options.gemini_path = Some(path);
+            if let Some(path) = cli_path {
+                options.cli_path = Some(path);
             }
 
             prompt(&prompt_text, options)
@@ -176,7 +226,8 @@ fn main() -> ExitCode {
             files,
             instruction,
             model,
-            gemini_path,
+            backend,
+            cli_path,
         } => {
             // Validate files exist
             for file in &files {
@@ -186,10 +237,15 @@ fn main() -> ExitCode {
                 }
             }
 
+            let backend: Backend = backend.into();
             let prompt_text = build_check_prompt(&instruction);
-            let mut options = AnalyzeOptions::with_model(model);
-            if let Some(path) = gemini_path {
-                options.gemini_path = Some(path);
+            let mut options = if let Some(m) = model {
+                AnalyzeOptions::with_model(m).with_backend(backend)
+            } else {
+                AnalyzeOptions::default().with_backend(backend)
+            };
+            if let Some(path) = cli_path {
+                options.cli_path = Some(path);
             }
 
             analyze(&prompt_text, &files, options)
@@ -199,7 +255,8 @@ fn main() -> ExitCode {
             files,
             instruction,
             model,
-            gemini_path,
+            backend,
+            cli_path,
         } => {
             // Validate files exist
             for file in &files {
@@ -209,10 +266,15 @@ fn main() -> ExitCode {
                 }
             }
 
+            let backend: Backend = backend.into();
             let prompt_text = build_compare_prompt(&files, &instruction);
-            let mut options = AnalyzeOptions::with_model(model);
-            if let Some(path) = gemini_path {
-                options.gemini_path = Some(path);
+            let mut options = if let Some(m) = model {
+                AnalyzeOptions::with_model(m).with_backend(backend)
+            } else {
+                AnalyzeOptions::default().with_backend(backend)
+            };
+            if let Some(path) = cli_path {
+                options.cli_path = Some(path);
             }
 
             analyze(&prompt_text, &files, options)
