@@ -452,11 +452,19 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
 }
 
 /// Run Codex CLI on Windows using PowerShell
+/// Uses stdin to pass prompt to avoid encoding issues
 fn run_codex_windows(
     work_dir: &Path,
     codex_path: &str,
     request: &AiRequest<'_>,
 ) -> Result<String> {
+    // Build prompt with file contents if files are provided
+    let full_prompt = build_codex_prompt(request)?;
+
+    // Write prompt to file for stdin input
+    let prompt_file = work_dir.join("prompt.txt");
+    fs::write(&prompt_file, &full_prompt)?;
+
     let ps_script = build_codex_ps_script(codex_path, request);
     let script_file = work_dir.join("run.ps1");
     fs::write(&script_file, &ps_script)?;
@@ -478,11 +486,19 @@ fn run_codex_windows(
 }
 
 /// Run Codex CLI on Unix systems
+/// Uses stdin to pass prompt to avoid encoding issues
 fn run_codex_unix(
     work_dir: &Path,
     codex_path: &str,
     request: &AiRequest<'_>,
 ) -> Result<String> {
+    // Build prompt with file contents if files are provided
+    let full_prompt = build_codex_prompt(request)?;
+
+    // Write prompt to file for stdin input
+    let prompt_file = work_dir.join("prompt.txt");
+    fs::write(&prompt_file, &full_prompt)?;
+
     let shell_script = build_codex_shell_script(codex_path, request);
     let script_file = work_dir.join("run.sh");
     fs::write(&script_file, &shell_script)?;
@@ -502,69 +518,60 @@ fn run_codex_unix(
     execute_command(cmd, work_dir)
 }
 
+/// Build the full prompt for Codex, including file contents if provided
+fn build_codex_prompt(request: &AiRequest<'_>) -> Result<String> {
+    if let Some(files) = request.files {
+        let mut full_prompt = String::new();
+
+        // Add file contents
+        for file_path in files {
+            let path = Path::new(file_path);
+            if path.exists() {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    Error::GeminiError(format!("Failed to read file {}: {}", file_path, e))
+                })?;
+                full_prompt.push_str(&format!(
+                    "=== File: {} ===\n{}\n\n",
+                    file_path, content
+                ));
+            }
+        }
+
+        // Add the original prompt
+        full_prompt.push_str(request.prompt);
+        Ok(full_prompt)
+    } else {
+        Ok(request.prompt.to_string())
+    }
+}
+
 /// Build PowerShell script for Codex on Windows
-/// Codex CLI format: codex exec -m model "prompt" [-i file1 file2...]
+/// Codex CLI format: echo "prompt" | codex exec -m model -
+/// Uses stdin to avoid encoding issues with quoted prompts
 fn build_codex_ps_script(codex_path: &str, request: &AiRequest<'_>) -> String {
     let codex_path = codex_path.replace('\'', "''");
     let model = request.model;
-    let prompt = request.prompt.replace('\'', "''").replace('`', "``");
 
-    let mut script = format!(
+    format!(
         r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-"#
-    );
-
-    // Build the command with arguments
-    // Codex uses -i for images, but we'll use it for file attachments
-    if let Some(files) = request.files {
-        let file_args = files
-            .iter()
-            .map(|f| format!("-i '{}'", f.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        script.push_str(&format!(
-            r#"& '{}' exec -m {} {} '{}'
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' exec -m {} -
 "#,
-            codex_path, model, file_args, prompt
-        ));
-    } else {
-        script.push_str(&format!(
-            r#"& '{}' exec -m {} '{}'
-"#,
-            codex_path, model, prompt
-        ));
-    }
-
-    script
+        codex_path, model
+    )
 }
 
 /// Build shell script for Codex on Unix
-/// Codex CLI format: codex exec -m model "prompt" [-i file1 file2...]
+/// Codex CLI format: cat prompt.txt | codex exec -m model -
+/// Uses stdin to avoid encoding issues with quoted prompts
 fn build_codex_shell_script(codex_path: &str, request: &AiRequest<'_>) -> String {
     let model = request.model;
-    let prompt = request.prompt.replace('\'', "'\\''");
 
-    if let Some(files) = request.files {
-        let file_args = files
-            .iter()
-            .map(|f| format!("-i '{}'", f.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!(
-            r#"#!/bin/bash
-'{}' exec -m {} {} '{}'
+    format!(
+        r#"#!/bin/bash
+cat prompt.txt | '{}' exec -m {} -
 "#,
-            codex_path, model, file_args, prompt
-        )
-    } else {
-        format!(
-            r#"#!/bin/bash
-'{}' exec -m {} '{}'
-"#,
-            codex_path, model, prompt
-        )
-    }
+        codex_path, model
+    )
 }
 
 /// Clean AI output by removing noise
@@ -723,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_codex_shell_script_no_files() {
+    fn test_build_codex_shell_script_stdin() {
         let req = AiRequest {
             prompt: "test prompt",
             model: "gpt-4.1",
@@ -735,23 +742,39 @@ mod tests {
         assert!(script.contains("codex"));
         assert!(script.contains("exec"));
         assert!(script.contains("-m gpt-4.1"));
-        assert!(script.contains("'test prompt'"));
-        assert!(!script.contains("-i"));
+        // Now uses stdin with '-' instead of quoted prompt
+        assert!(script.contains("cat prompt.txt"));
+        assert!(script.contains(" -"));
     }
 
     #[test]
-    fn test_build_codex_shell_script_with_files() {
-        let files = vec!["doc.pdf".to_string(), "image.png".to_string()];
+    fn test_build_codex_prompt_no_files() {
         let req = AiRequest {
-            prompt: "analyze these",
+            prompt: "test prompt",
             model: "gpt-4.1",
-            files: Some(&files),
+            files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
         };
-        let script = build_codex_shell_script("codex", &req);
+        let prompt = build_codex_prompt(&req).unwrap();
+        assert_eq!(prompt, "test prompt");
+    }
+
+    #[test]
+    fn test_build_codex_ps_script_stdin() {
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "gpt-4.1",
+            files: None,
+            output_format: OutputFormat::Text,
+            backend: Backend::Codex,
+        };
+        let script = build_codex_ps_script("codex", &req);
+        assert!(script.contains("codex"));
         assert!(script.contains("exec"));
-        assert!(script.contains("-i 'doc.pdf'"));
-        assert!(script.contains("-i 'image.png'"));
+        assert!(script.contains("-m gpt-4.1"));
+        // Now uses stdin with '-' instead of quoted prompt
+        assert!(script.contains("Get-Content -Raw -Encoding UTF8 'prompt.txt'"));
+        assert!(script.contains(" -"));
     }
 }
