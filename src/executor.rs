@@ -279,8 +279,15 @@ fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
 /// Build PowerShell script for Windows
 fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
     let gemini_path = gemini_path.replace('\'', "''");
-    let model = request.model;
-    let output_format = request.output_format.as_str();
+    // Always use text output for Gemini CLI - json output includes session metadata
+    let output_format = "text";
+
+    // Build model option - skip if files are provided (let Gemini choose multimodal model)
+    let model_opt = if request.files.is_some() {
+        String::new() // No model option for multimodal requests
+    } else {
+        format!("-m {} ", request.model)
+    };
 
     if let Some(files) = request.files {
         let file_array = files
@@ -293,24 +300,31 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
 $files = @(
 {}
 )
-Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -m {} -o {} $files
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' {}-o {} $files
 "#,
-            file_array, gemini_path, model, output_format
+            file_array, gemini_path, model_opt, output_format
         )
     } else {
         format!(
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -m {} -o {}
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' {}-o {}
 "#,
-            gemini_path, model, output_format
+            gemini_path, model_opt, output_format
         )
     }
 }
 
 /// Build shell script for Unix
 fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
-    let model = request.model;
-    let output_format = request.output_format.as_str();
+    // Always use text output for Gemini CLI - json output includes session metadata
+    let output_format = "text";
+
+    // Build model option - skip if files are provided (let Gemini choose multimodal model)
+    let model_opt = if request.files.is_some() {
+        String::new() // No model option for multimodal requests
+    } else {
+        format!("-m {} ", request.model)
+    };
 
     if let Some(files) = request.files {
         let file_args = files
@@ -320,27 +334,35 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
             .join(" ");
         format!(
             r#"#!/bin/bash
-cat prompt.txt | '{}' -m {} -o {} {}
+cat prompt.txt | '{}' {}-o {} {}
 "#,
-            gemini_path, model, output_format, file_args
+            gemini_path, model_opt, output_format, file_args
         )
     } else {
         format!(
             r#"#!/bin/bash
-cat prompt.txt | '{}' -m {} -o {}
+cat prompt.txt | '{}' {}-o {}
 "#,
-            gemini_path, model, output_format
+            gemini_path, model_opt, output_format
         )
     }
 }
 
 /// Run Claude CLI on Windows using PowerShell
+/// Uses stdin to pass prompt to avoid encoding issues with non-ASCII characters
 fn run_claude_windows(
     work_dir: &Path,
     claude_path: &str,
     request: &AiRequest<'_>,
 ) -> Result<String> {
-    let ps_script = build_claude_ps_script(claude_path, request);
+    // Build prompt with file contents if files are provided
+    let full_prompt = build_claude_prompt(request)?;
+
+    // Write prompt to file for stdin input (avoids PowerShell encoding issues)
+    let prompt_file = work_dir.join("prompt.txt");
+    fs::write(&prompt_file, &full_prompt)?;
+
+    let ps_script = build_claude_ps_script_stdin(claude_path, request);
     let script_file = work_dir.join("run.ps1");
     fs::write(&script_file, &ps_script)?;
 
@@ -361,12 +383,20 @@ fn run_claude_windows(
 }
 
 /// Run Claude CLI on Unix systems
+/// Uses stdin to pass prompt to avoid encoding issues with non-ASCII characters
 fn run_claude_unix(
     work_dir: &Path,
     claude_path: &str,
     request: &AiRequest<'_>,
 ) -> Result<String> {
-    let shell_script = build_claude_shell_script(claude_path, request);
+    // Build prompt with file contents if files are provided
+    let full_prompt = build_claude_prompt(request)?;
+
+    // Write prompt to file for stdin input
+    let prompt_file = work_dir.join("prompt.txt");
+    fs::write(&prompt_file, &full_prompt)?;
+
+    let shell_script = build_claude_shell_script_stdin(claude_path, request);
     let script_file = work_dir.join("run.sh");
     fs::write(&script_file, &shell_script)?;
 
@@ -385,8 +415,9 @@ fn run_claude_unix(
     execute_command(cmd, work_dir)
 }
 
-/// Build PowerShell script for Claude on Windows
-/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--files file1 file2...]
+/// Build PowerShell script for Claude on Windows (legacy, uses quoted prompt)
+/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--file file1 file2...]
+#[allow(dead_code)]
 fn build_claude_ps_script(claude_path: &str, request: &AiRequest<'_>) -> String {
     let claude_path = claude_path.replace('\'', "''");
     let model = request.model;
@@ -408,7 +439,7 @@ fn build_claude_ps_script(claude_path: &str, request: &AiRequest<'_>) -> String 
 
         script.push_str(&format!(
             r#"$files = @({})
-& '{}' -p '{}' --model {} --output-format text --files $files
+& '{}' -p '{}' --model {} --output-format text --file $files
 "#,
             file_array, claude_path, prompt, model
         ));
@@ -423,8 +454,9 @@ fn build_claude_ps_script(claude_path: &str, request: &AiRequest<'_>) -> String 
     script
 }
 
-/// Build shell script for Claude on Unix
-/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--files file1 file2...]
+/// Build shell script for Claude on Unix (legacy, uses quoted prompt)
+/// Claude CLI format: claude -p "prompt" --model model [--output-format format] [--file file1 file2...]
+#[allow(dead_code)]
 fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> String {
     let model = request.model;
     let prompt = request.prompt.replace('\'', "'\\''");
@@ -437,7 +469,7 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
             .join(" ");
         format!(
             r#"#!/bin/bash
-'{}' -p '{}' --model {} --output-format text --files {}
+'{}' -p '{}' --model {} --output-format text --file {}
 "#,
             claude_path, prompt, model, file_args
         )
@@ -447,6 +479,90 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
 '{}' -p '{}' --model {} --output-format text
 "#,
             claude_path, prompt, model
+        )
+    }
+}
+
+/// Build the full prompt for Claude, including file contents if provided
+fn build_claude_prompt(request: &AiRequest<'_>) -> Result<String> {
+    if let Some(files) = request.files {
+        let mut full_prompt = String::new();
+
+        // Add file contents
+        for file_path in files {
+            let path = Path::new(file_path);
+            if path.exists() {
+                let content = fs::read_to_string(path).map_err(|e| {
+                    Error::GeminiError(format!("Failed to read file {}: {}", file_path, e))
+                })?;
+                full_prompt.push_str(&format!(
+                    "=== File: {} ===\n{}\n\n",
+                    file_path, content
+                ));
+            }
+        }
+
+        // Add the original prompt
+        full_prompt.push_str(request.prompt);
+        Ok(full_prompt)
+    } else {
+        Ok(request.prompt.to_string())
+    }
+}
+
+/// Build PowerShell script for Claude on Windows using stdin
+/// Claude CLI: cat prompt.txt | claude -p - --model model --output-format text [--file file1 file2...]
+fn build_claude_ps_script_stdin(claude_path: &str, request: &AiRequest<'_>) -> String {
+    let claude_path = claude_path.replace('\'', "''");
+    let model = request.model;
+
+    if let Some(files) = request.files {
+        let file_array = files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+$files = @({})
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -p - --model {} --output-format text --file $files
+"#,
+            file_array, claude_path, model
+        )
+    } else {
+        format!(
+            r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -p - --model {} --output-format text
+"#,
+            claude_path, model
+        )
+    }
+}
+
+/// Build shell script for Claude on Unix using stdin
+/// Claude CLI: cat prompt.txt | claude -p - --model model --output-format text [--file file1 file2...]
+fn build_claude_shell_script_stdin(claude_path: &str, request: &AiRequest<'_>) -> String {
+    let model = request.model;
+
+    if let Some(files) = request.files {
+        let file_args = files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"#!/bin/bash
+cat prompt.txt | '{}' -p - --model {} --output-format text --file {}
+"#,
+            claude_path, model, file_args
+        )
+    } else {
+        format!(
+            r#"#!/bin/bash
+cat prompt.txt | '{}' -p - --model {} --output-format text
+"#,
+            claude_path, model
         )
     }
 }
@@ -601,6 +717,131 @@ fn write_error_log(work_dir: &Path, detail: &str) {
     let _ = fs::write(log_path, detail);
 }
 
+/// Gemini usage stats and rate limit info
+#[derive(Debug, Clone, Default)]
+pub struct GeminiStats {
+    /// Whether the API is accessible
+    pub is_available: bool,
+    /// Error message if rate limited
+    pub rate_limit_message: Option<String>,
+    /// Requests per minute limit (from error)
+    pub rpm_limit: Option<u32>,
+    /// Tokens per minute limit (from error)
+    pub tpm_limit: Option<u64>,
+    /// Retry after seconds (from error)
+    pub retry_after_seconds: Option<u32>,
+    /// Raw response for debugging
+    pub raw_response: String,
+}
+
+impl GeminiStats {
+    /// Parse stats from error output
+    pub fn from_error(error_msg: &str) -> Self {
+        let mut stats = Self {
+            is_available: false,
+            raw_response: error_msg.to_string(),
+            ..Default::default()
+        };
+
+        // Parse rate limit info from error messages
+        // Example: "Resource has been exhausted (e.g. check quota)."
+        // Example: "429 Too Many Requests"
+        // Example: "RATE_LIMIT_EXCEEDED"
+        let msg_lower = error_msg.to_lowercase();
+
+        if msg_lower.contains("rate") || msg_lower.contains("quota") || msg_lower.contains("429") {
+            stats.rate_limit_message = Some(error_msg.to_string());
+
+            // Try to extract retry time
+            if let Some(seconds) = extract_number_after(error_msg, "retry") {
+                stats.retry_after_seconds = Some(seconds as u32);
+            }
+            if let Some(seconds) = extract_number_after(error_msg, "wait") {
+                stats.retry_after_seconds = Some(seconds as u32);
+            }
+        }
+
+        stats
+    }
+
+    /// Create stats for successful response
+    pub fn available() -> Self {
+        Self {
+            is_available: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// Extract number appearing after a keyword
+fn extract_number_after(s: &str, keyword: &str) -> Option<u64> {
+    let lower = s.to_lowercase();
+    if let Some(pos) = lower.find(keyword) {
+        let after = &s[pos..];
+        after
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    } else {
+        None
+    }
+}
+
+/// Check Gemini API availability with a minimal request
+pub fn check_gemini_status(custom_gemini_path: Option<&str>) -> Result<GeminiStats> {
+    let gemini_path = gemini_cmd_path(custom_gemini_path);
+    let work_dir = std::env::temp_dir();
+
+    // Send a minimal prompt to check if API is accessible
+    let test_prompt = "respond with just: ok";
+
+    #[cfg(target_os = "windows")]
+    let result = {
+        let ps_script = format!(
+            r#"& '{}' -p '{}'"#,
+            gemini_path.replace('\'', "''"),
+            test_prompt.replace('\'', "''")
+        );
+
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &ps_script]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        execute_command(cmd, &work_dir)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let result = {
+        let mut cmd = Command::new(&gemini_path);
+        cmd.args(["-p", test_prompt]);
+
+        execute_command(cmd, &work_dir)
+    };
+
+    match result {
+        Ok(output) => {
+            let cleaned = clean_ai_output(&output);
+            if cleaned.to_lowercase().contains("ok") {
+                Ok(GeminiStats::available())
+            } else {
+                // Might be rate limited with a specific message
+                Ok(GeminiStats::from_error(&output))
+            }
+        }
+        Err(e) => {
+            Ok(GeminiStats::from_error(&e.to_string()))
+        }
+    }
+}
+
+/// Alias for backward compatibility
+pub fn get_gemini_stats(custom_gemini_path: Option<&str>) -> Result<GeminiStats> {
+    check_gemini_status(custom_gemini_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,7 +941,7 @@ mod tests {
         assert!(script.contains("-p 'test prompt'"));
         assert!(script.contains("--model claude-sonnet-4-20250514"));
         assert!(script.contains("--output-format text"));
-        assert!(!script.contains("--files"));
+        assert!(!script.contains("--file"));
     }
 
     #[test]
@@ -714,7 +955,7 @@ mod tests {
             backend: Backend::Claude,
         };
         let script = build_claude_shell_script("claude", &req);
-        assert!(script.contains("--files"));
+        assert!(script.contains("--file"));
         assert!(script.contains("'doc.pdf'"));
         assert!(script.contains("'image.png'"));
     }

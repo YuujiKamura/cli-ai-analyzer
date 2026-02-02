@@ -38,7 +38,7 @@ impl Backend {
     /// Get the default model for this backend
     pub fn default_model(&self) -> &str {
         match self {
-            Backend::Gemini => "gemini-2.5-flash",
+            Backend::Gemini => "gemini-2.5-pro",
             Backend::Claude => "claude-sonnet-4-20250514",
             Backend::Codex => "gpt-4.1",
             Backend::Ollama => "llama3",
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn test_backend_default_model() {
-        assert_eq!(Backend::Gemini.default_model(), "gemini-2.5-flash");
+        assert_eq!(Backend::Gemini.default_model(), "gemini-2.5-pro");
         assert_eq!(Backend::Claude.default_model(), "claude-sonnet-4-20250514");
         assert_eq!(Backend::Codex.default_model(), "gpt-4.1");
         assert_eq!(Backend::Ollama.default_model(), "llama3");

@@ -46,12 +46,12 @@ mod temp;
 
 pub use backend::Backend;
 pub use error::{Error, Result};
-pub use executor::{AiRequest, GeminiRequest, OutputFormat};
+pub use executor::{AiRequest, GeminiRequest, GeminiStats, OutputFormat, get_gemini_stats, check_gemini_status};
 
 use std::path::Path;
 
 /// Default Gemini model
-pub const DEFAULT_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_MODEL: &str = "gemini-2.5-pro";
 
 /// Default Claude model
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
