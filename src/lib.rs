@@ -67,6 +67,8 @@ pub struct AnalyzeOptions {
     pub cli_path: Option<String>,
     /// Backend to use (Gemini, Claude, etc.)
     pub backend: Backend,
+    /// Partial JSON with null values to fill in
+    pub partial_json: Option<String>,
 }
 
 impl Default for AnalyzeOptions {
@@ -76,6 +78,7 @@ impl Default for AnalyzeOptions {
             output_format: OutputFormat::Text,
             cli_path: None,
             backend: Backend::default(),
+            partial_json: None,
         }
     }
 }
@@ -121,6 +124,12 @@ impl AnalyzeOptions {
     #[deprecated(since = "0.2.0", note = "Use cli_path field instead")]
     pub fn gemini_path(&self) -> Option<&String> {
         self.cli_path.as_ref()
+    }
+
+    /// Set partial JSON with null values to fill in
+    pub fn with_partial_json(mut self, partial_json: impl Into<String>) -> Self {
+        self.partial_json = Some(partial_json.into());
+        self
     }
 }
 
@@ -216,12 +225,14 @@ pub fn analyze_in_dir<P: AsRef<Path>>(
         file_names.push(file_name);
     }
 
+    let partial_json_ref = options.partial_json.as_deref();
     let request = AiRequest {
         prompt,
         model: &options.model,
         files: Some(&file_names),
         output_format: options.output_format,
         backend: options.backend,
+        partial_json: partial_json_ref,
     };
 
     executor::run_ai(work_dir, &request, options.cli_path.as_deref())
@@ -229,12 +240,14 @@ pub fn analyze_in_dir<P: AsRef<Path>>(
 
 /// Run a prompt without files in a specific directory
 pub fn prompt_in_dir(work_dir: &Path, prompt: &str, options: AnalyzeOptions) -> Result<String> {
+    let partial_json_ref = options.partial_json.as_deref();
     let request = AiRequest {
         prompt,
         model: &options.model,
         files: None,
         output_format: options.output_format,
         backend: options.backend,
+        partial_json: partial_json_ref,
     };
 
     executor::run_ai(work_dir, &request, options.cli_path.as_deref())
@@ -299,6 +312,12 @@ impl AnalysisBuilder {
     /// Set custom Gemini CLI path (backward compatibility alias)
     pub fn gemini_path(mut self, path: impl Into<String>) -> Self {
         self.options.cli_path = Some(path.into());
+        self
+    }
+
+    /// Set partial JSON with null values to fill in
+    pub fn partial_json(mut self, partial_json: impl Into<String>) -> Self {
+        self.options.partial_json = Some(partial_json.into());
         self
     }
 

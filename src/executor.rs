@@ -37,6 +37,8 @@ pub struct AiRequest<'a> {
     pub output_format: OutputFormat,
     /// Backend to use
     pub backend: Backend,
+    /// Partial JSON with null values to fill in
+    pub partial_json: Option<&'a str>,
 }
 
 /// Alias for backward compatibility
@@ -51,6 +53,7 @@ impl<'a> AiRequest<'a> {
             files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Gemini,
+            partial_json: None,
         }
     }
 
@@ -62,6 +65,7 @@ impl<'a> AiRequest<'a> {
             files: Some(files),
             output_format: OutputFormat::Text,
             backend: Backend::Gemini,
+            partial_json: None,
         }
     }
 
@@ -73,6 +77,7 @@ impl<'a> AiRequest<'a> {
             files: None,
             output_format: OutputFormat::Json,
             backend: Backend::Gemini,
+            partial_json: None,
         }
     }
 
@@ -84,12 +89,19 @@ impl<'a> AiRequest<'a> {
             files: Some(files),
             output_format: OutputFormat::Json,
             backend: Backend::Gemini,
+            partial_json: None,
         }
     }
 
     /// Set the backend to use
     pub fn with_backend(mut self, backend: Backend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Set partial JSON to fill in null values
+    pub fn with_partial_json(mut self, partial_json: &'a str) -> Self {
+        self.partial_json = Some(partial_json);
         self
     }
 }
@@ -312,11 +324,13 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Add JSON reinforcement suffix if prompt requests JSON output
-        let json_suffix = if request.output_format == OutputFormat::Json {
-            " Respond with ONLY the JSON object."
+        // Build JSON suffix based on partial_json or output_format
+        let json_suffix = if let Some(partial) = request.partial_json {
+            format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "`\""))
+        } else if request.output_format == OutputFormat::Json {
+            " Respond with ONLY the JSON object.".to_string()
         } else {
-            ""
+            String::new()
         };
 
         format!(
@@ -358,11 +372,13 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Add JSON reinforcement suffix if prompt requests JSON output
-        let json_suffix = if request.output_format == OutputFormat::Json {
-            " Respond with ONLY the JSON object."
+        // Build JSON suffix based on partial_json or output_format
+        let json_suffix = if let Some(partial) = request.partial_json {
+            format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "\\\""))
+        } else if request.output_format == OutputFormat::Json {
+            " Respond with ONLY the JSON object.".to_string()
         } else {
-            ""
+            String::new()
         };
 
         format!(
@@ -995,6 +1011,7 @@ mod tests {
             files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Claude,
+            partial_json: None,
         };
         let script = build_claude_shell_script("claude", &req);
         assert!(script.contains("claude"));
@@ -1013,6 +1030,7 @@ mod tests {
             files: Some(&files),
             output_format: OutputFormat::Text,
             backend: Backend::Claude,
+            partial_json: None,
         };
         let script = build_claude_shell_script("claude", &req);
         assert!(script.contains("--file"));
@@ -1038,6 +1056,7 @@ mod tests {
             files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
+            partial_json: None,
         };
         let script = build_codex_shell_script("codex", &req);
         assert!(script.contains("codex"));
@@ -1056,6 +1075,7 @@ mod tests {
             files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
+            partial_json: None,
         };
         let prompt = build_codex_prompt(&req).unwrap();
         assert_eq!(prompt, "test prompt");
@@ -1069,6 +1089,7 @@ mod tests {
             files: None,
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
+            partial_json: None,
         };
         let script = build_codex_ps_script("codex", &req);
         assert!(script.contains("codex"));
