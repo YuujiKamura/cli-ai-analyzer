@@ -23,14 +23,6 @@ pub enum OutputFormat {
     Json,
 }
 
-impl OutputFormat {
-    fn as_str(&self) -> &'static str {
-        match self {
-            OutputFormat::Text => "text",
-            OutputFormat::Json => "json",
-        }
-    }
-}
 
 /// Request parameters for AI CLI
 #[derive(Debug)]
@@ -241,7 +233,28 @@ fn run_gemini_unix(
 
 /// Execute the command and process output
 fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
+    // Debug: write command info
+    let debug_path = work_dir.join("debug.log");
+    let _ = fs::write(&debug_path, format!("Command: {:?}\nWorkDir: {:?}\n", cmd, work_dir));
+
     let output = cmd.output()?;
+
+    // Debug: append output info
+    let debug_info = format!(
+        "Status: {:?}\nStdout len: {}\nStderr len: {}\nStdout: {}\nStderr: {}\n",
+        output.status,
+        output.stdout.len(),
+        output.stderr.len(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let _ = fs::OpenOptions::new()
+        .append(true)
+        .open(&debug_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(debug_info.as_bytes())
+        });
 
     if output.status.success() {
         let result = String::from_utf8_lossy(&output.stdout).to_string();
@@ -282,27 +295,37 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
     // Always use text output for Gemini CLI - json output includes session metadata
     let output_format = "text";
 
-    // Build model option - skip if files are provided (let Gemini choose multimodal model)
-    let model_opt = if request.files.is_some() {
-        String::new() // No model option for multimodal requests
+    // Build model option - use default if model is empty
+    let model = if request.model.is_empty() {
+        "gemini-2.0-flash"
     } else {
-        format!("-m {} ", request.model)
+        request.model
     };
+    let model_opt = format!("-m {} ", model);
 
     if let Some(files) = request.files {
-        let file_array = files
+        // Use @filename syntax to reference files in gemini CLI
+        // File reference first, then prompt (matches successful manual test)
+        let file_refs = files
             .iter()
-            .map(|f| format!("    '{}'", f.replace('\'', "''")))
+            .map(|f| format!("@{}", f.replace('\'', "''")))
             .collect::<Vec<_>>()
-            .join(",\n");
+            .join(" ");
+
+        // Add JSON reinforcement suffix if prompt requests JSON output
+        let json_suffix = if request.output_format == OutputFormat::Json {
+            " Respond with ONLY the JSON object."
+        } else {
+            ""
+        };
+
         format!(
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-$files = @(
-{}
-)
-Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' {}-o {} $files
+$prompt = Get-Content -Raw -Encoding UTF8 'prompt.txt'
+$fullPrompt = "{} " + $prompt + "{}"
+& '{}' {}--yolo -o {} -p $fullPrompt
 "#,
-            file_array, gemini_path, model_opt, output_format
+            file_refs, json_suffix, gemini_path, model_opt, output_format
         )
     } else {
         format!(
@@ -319,24 +342,35 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
     // Always use text output for Gemini CLI - json output includes session metadata
     let output_format = "text";
 
-    // Build model option - skip if files are provided (let Gemini choose multimodal model)
-    let model_opt = if request.files.is_some() {
-        String::new() // No model option for multimodal requests
+    // Build model option - use default if model is empty
+    let model = if request.model.is_empty() {
+        "gemini-2.0-flash"
     } else {
-        format!("-m {} ", request.model)
+        request.model
     };
+    let model_opt = format!("-m {} ", model);
 
     if let Some(files) = request.files {
-        let file_args = files
+        // Use @filename syntax to reference files in gemini CLI
+        let file_refs = files
             .iter()
-            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
+            .map(|f| format!("@{}", f.replace('\'', "'\\''")))
             .collect::<Vec<_>>()
             .join(" ");
+
+        // Add JSON reinforcement suffix if prompt requests JSON output
+        let json_suffix = if request.output_format == OutputFormat::Json {
+            " Respond with ONLY the JSON object."
+        } else {
+            ""
+        };
+
         format!(
             r#"#!/bin/bash
-cat prompt.txt | '{}' {}-o {} {}
+prompt=$(cat prompt.txt)
+'{}' {}--yolo -o {} -p "{} $prompt{}"
 "#,
-            gemini_path, model_opt, output_format, file_args
+            gemini_path, model_opt, output_format, file_refs, json_suffix
         )
     } else {
         format!(
@@ -692,17 +726,43 @@ cat prompt.txt | '{}' exec -m {} -
 
 /// Clean AI output by removing noise
 pub fn clean_ai_output(output: &str) -> String {
-    output
+    let filtered: String = output
         .lines()
         .filter(|line| {
             // Gemini noise
             !line.contains("Loaded cached credentials")
                 && !line.contains("Hook registry initialized")
+                && !line.contains("YOLO mode is enabled")
                 // Claude noise (if any)
                 && !line.starts_with("Loading")
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // Strip markdown code blocks if present (e.g., ```json...```)
+    strip_markdown_code_blocks(&filtered)
+}
+
+/// Strip markdown code block markers from output
+fn strip_markdown_code_blocks(s: &str) -> String {
+    let trimmed = s.trim();
+
+    // Check for ```json or ``` at start
+    if let Some(rest) = trimmed.strip_prefix("```json") {
+        if let Some(content) = rest.strip_suffix("```") {
+            return content.trim().to_string();
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        // Could be ```\n or just ```
+        let rest = rest.trim_start_matches(|c: char| c.is_alphabetic()); // strip language hint
+        if let Some(content) = rest.strip_suffix("```") {
+            return content.trim().to_string();
+        }
+    }
+
+    trimmed.to_string()
 }
 
 /// Alias for backward compatibility
@@ -848,9 +908,9 @@ mod tests {
 
     #[test]
     fn test_gemini_request_text() {
-        let req = AiRequest::text("test prompt", "gemini-2.5-flash");
+        let req = AiRequest::text("test prompt", "gemini-2.0-flash");
         assert_eq!(req.prompt, "test prompt");
-        assert_eq!(req.model, "gemini-2.5-flash");
+        assert_eq!(req.model, "gemini-2.0-flash");
         assert!(req.files.is_none());
         assert_eq!(req.output_format, OutputFormat::Text);
         assert_eq!(req.backend, Backend::Gemini);
@@ -859,7 +919,7 @@ mod tests {
     #[test]
     fn test_gemini_request_json_with_files() {
         let files = vec!["a.pdf".to_string(), "b.pdf".to_string()];
-        let req = AiRequest::json_with_files("test", "gemini-2.5-flash", &files);
+        let req = AiRequest::json_with_files("test", "gemini-2.0-flash", &files);
         assert!(req.files.is_some());
         assert_eq!(req.output_format, OutputFormat::Json);
     }

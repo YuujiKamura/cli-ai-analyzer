@@ -51,7 +51,7 @@ pub use executor::{AiRequest, GeminiRequest, GeminiStats, OutputFormat, get_gemi
 use std::path::Path;
 
 /// Default Gemini model
-pub const DEFAULT_MODEL: &str = "gemini-2.5-pro";
+pub const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 
 /// Default Claude model
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
