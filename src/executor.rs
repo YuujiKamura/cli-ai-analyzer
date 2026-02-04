@@ -297,7 +297,7 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
 
     // Build model option - use default if model is empty
     let model = if request.model.is_empty() {
-        "gemini-2.0-flash"
+        "gemini-2.5-flash"
     } else {
         request.model
     };
@@ -344,7 +344,7 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
 
     // Build model option - use default if model is empty
     let model = if request.model.is_empty() {
-        "gemini-2.0-flash"
+        "gemini-2.5-flash"
     } else {
         request.model
     };
@@ -908,9 +908,9 @@ mod tests {
 
     #[test]
     fn test_gemini_request_text() {
-        let req = AiRequest::text("test prompt", "gemini-2.0-flash");
+        let req = AiRequest::text("test prompt", "gemini-2.5-flash");
         assert_eq!(req.prompt, "test prompt");
-        assert_eq!(req.model, "gemini-2.0-flash");
+        assert_eq!(req.model, "gemini-2.5-flash");
         assert!(req.files.is_none());
         assert_eq!(req.output_format, OutputFormat::Text);
         assert_eq!(req.backend, Backend::Gemini);
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn test_gemini_request_json_with_files() {
         let files = vec!["a.pdf".to_string(), "b.pdf".to_string()];
-        let req = AiRequest::json_with_files("test", "gemini-2.0-flash", &files);
+        let req = AiRequest::json_with_files("test", "gemini-2.5-flash", &files);
         assert!(req.files.is_some());
         assert_eq!(req.output_format, OutputFormat::Json);
     }

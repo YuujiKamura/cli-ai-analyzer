@@ -51,7 +51,7 @@ pub use executor::{AiRequest, GeminiRequest, GeminiStats, OutputFormat, get_gemi
 use std::path::Path;
 
 /// Default Gemini model
-pub const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+pub const DEFAULT_MODEL: &str = "gemini-2.5-flash";
 
 /// Default Claude model
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
@@ -326,11 +326,11 @@ mod tests {
 
     #[test]
     fn test_analyze_options_builder() {
-        let opts = AnalyzeOptions::with_model("gemini-2.0-flash-exp")
+        let opts = AnalyzeOptions::with_model("gemini-2.5-flash-exp")
             .json()
             .with_cli_path("/custom/path");
 
-        assert_eq!(opts.model, "gemini-2.0-flash-exp");
+        assert_eq!(opts.model, "gemini-2.5-flash-exp");
         assert!(matches!(opts.output_format, OutputFormat::Json));
         assert_eq!(opts.cli_path, Some("/custom/path".to_string()));
     }
@@ -355,12 +355,12 @@ mod tests {
         let builder = AnalysisBuilder::new("test prompt")
             .file("file1.pdf")
             .file("file2.pdf")
-            .model("gemini-2.0-flash-exp")
+            .model("gemini-2.5-flash-exp")
             .json();
 
         assert_eq!(builder.prompt, "test prompt");
         assert_eq!(builder.files.len(), 2);
-        assert_eq!(builder.options.model, "gemini-2.0-flash-exp");
+        assert_eq!(builder.options.model, "gemini-2.5-flash-exp");
     }
 
     #[test]
