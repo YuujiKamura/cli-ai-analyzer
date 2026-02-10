@@ -7,8 +7,11 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, UsageMode};
 use crate::error::{Error, Result};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 /// Windows flag to hide console window
 #[cfg(target_os = "windows")]
@@ -39,6 +42,8 @@ pub struct AiRequest<'a> {
     pub backend: Backend,
     /// Partial JSON with null values to fill in
     pub partial_json: Option<&'a str>,
+    /// Usage mode (billing model)
+    pub usage_mode: UsageMode,
 }
 
 /// Alias for backward compatibility
@@ -54,6 +59,7 @@ impl<'a> AiRequest<'a> {
             output_format: OutputFormat::Text,
             backend: Backend::Gemini,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         }
     }
 
@@ -66,6 +72,7 @@ impl<'a> AiRequest<'a> {
             output_format: OutputFormat::Text,
             backend: Backend::Gemini,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         }
     }
 
@@ -78,6 +85,7 @@ impl<'a> AiRequest<'a> {
             output_format: OutputFormat::Json,
             backend: Backend::Gemini,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         }
     }
 
@@ -90,6 +98,7 @@ impl<'a> AiRequest<'a> {
             output_format: OutputFormat::Json,
             backend: Backend::Gemini,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         }
     }
 
@@ -102,6 +111,12 @@ impl<'a> AiRequest<'a> {
     /// Set partial JSON to fill in null values
     pub fn with_partial_json(mut self, partial_json: &'a str) -> Self {
         self.partial_json = Some(partial_json);
+        self
+    }
+
+    /// Set usage mode (billing model)
+    pub fn with_usage_mode(mut self, usage_mode: UsageMode) -> Self {
+        self.usage_mode = usage_mode;
         self
     }
 }
@@ -145,6 +160,16 @@ pub fn run_ai(
     request: &AiRequest<'_>,
     custom_cli_path: Option<&str>,
 ) -> Result<String> {
+    // PayPerUse mode: call Gemini REST API directly (Gemini backend only)
+    if request.usage_mode == UsageMode::PayPerUse {
+        if request.backend != Backend::Gemini {
+            return Err(Error::GeminiError(
+                "PayPerUse mode is only supported for Gemini backend.".into(),
+            ));
+        }
+        return run_gemini_rest_api(work_dir, request);
+    }
+
     let cli_path = cli_cmd_path(request.backend, custom_cli_path);
 
     // Build and execute script based on backend
@@ -182,6 +207,172 @@ pub fn run_ai(
     }
 }
 
+/// Run Gemini REST API directly (PayPerUse mode)
+fn run_gemini_rest_api(
+    work_dir: &Path,
+    request: &AiRequest<'_>,
+) -> Result<String> {
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| {
+        Error::GeminiError(
+            "GEMINI_API_KEY environment variable is not set. \
+             Required for PayPerUse mode."
+                .into(),
+        )
+    })?;
+
+    let model = if request.model.is_empty() {
+        "gemini-3-flash-preview"
+    } else {
+        request.model
+    };
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    // Build prompt text with JSON suffix if needed
+    let prompt_text = if let Some(partial) = request.partial_json {
+        format!(
+            "{} Fill in the null values in this JSON based on the image: {}",
+            request.prompt, partial
+        )
+    } else if request.output_format == OutputFormat::Json {
+        format!("{} Respond with ONLY the JSON object.", request.prompt)
+    } else {
+        request.prompt.to_string()
+    };
+
+    // Build parts array
+    let mut parts = Vec::new();
+
+    // Add text part
+    parts.push(serde_json::json!({"text": prompt_text}));
+
+    // Add image parts (base64 encoded)
+    if let Some(files) = request.files {
+        for file_path in files {
+            // Resolve path: if relative, join with work_dir
+            let path = if Path::new(file_path).is_absolute() {
+                std::path::PathBuf::from(file_path)
+            } else {
+                work_dir.join(file_path)
+            };
+
+            if !path.exists() {
+                return Err(Error::FileNotFound(path));
+            }
+
+            let data = fs::read(&path)?;
+            let b64 = BASE64_STANDARD.encode(&data);
+
+            let mime_type = mime_guess::from_path(&path)
+                .first_raw()
+                .unwrap_or("application/octet-stream");
+
+            parts.push(serde_json::json!({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": b64
+                }
+            }));
+        }
+    }
+
+    let body = serde_json::json!({
+        "contents": [{
+            "parts": parts
+        }]
+    });
+
+    // Debug log the request (without base64 data)
+    let debug_path = work_dir.join("debug.log");
+    let _ = fs::write(
+        &debug_path,
+        format!(
+            "PayPerUse REST API\nURL: https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent\nParts count: {}\n",
+            model,
+            parts.len()
+        ),
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| Error::GeminiError(format!("Failed to create HTTP client: {}", e)))?;
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| Error::GeminiError(format!("HTTP request failed: {}", e)))?;
+
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|e| Error::GeminiError(format!("Failed to read response body: {}", e)))?;
+
+    // Debug log the response
+    let _ = fs::OpenOptions::new()
+        .append(true)
+        .open(&debug_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(
+                format!(
+                    "Status: {}\nResponse: {}\n",
+                    status,
+                    &response_text[..response_text.len().min(2000)]
+                )
+                .as_bytes(),
+            )
+        });
+
+    if !status.is_success() {
+        let detail = format!("Gemini API error ({}): {}", status, response_text);
+        write_error_log(work_dir, &detail);
+
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(Error::AuthenticationFailed);
+        }
+        return Err(Error::GeminiError(detail));
+    }
+
+    // Parse the JSON response
+    let resp: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+        Error::GeminiError(format!(
+            "Failed to parse API response: {}. Body: {}",
+            e,
+            &response_text[..response_text.len().min(500)]
+        ))
+    })?;
+
+    // Extract text from candidates[0].content.parts[0].text
+    let text = resp
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| {
+            // Check for error or blocked response
+            let error_msg = resp
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("No text in response");
+            Error::GeminiError(format!(
+                "Unexpected API response: {}. Full: {}",
+                error_msg,
+                &response_text[..response_text.len().min(500)]
+            ))
+        })?;
+
+    Ok(clean_ai_output(text))
+}
+
 /// Run Gemini CLI with the given request (backward compatibility)
 #[allow(dead_code)]
 pub fn run_gemini(
@@ -190,6 +381,62 @@ pub fn run_gemini(
     custom_gemini_path: Option<&str>,
 ) -> Result<String> {
     run_ai(work_dir, request, custom_gemini_path)
+}
+
+/// Run AI CLI with `--resume latest` to continue an existing Gemini session.
+/// Non-Gemini backends fall back to `run_ai` (no session concept).
+pub(crate) fn run_ai_resume(
+    work_dir: &Path,
+    request: &AiRequest<'_>,
+    custom_cli_path: Option<&str>,
+) -> Result<String> {
+    if request.backend != Backend::Gemini {
+        return run_ai(work_dir, request, custom_cli_path);
+    }
+
+    let cli_path = cli_cmd_path(request.backend, custom_cli_path);
+
+    // Write prompt to file
+    let prompt_file = work_dir.join("prompt.txt");
+    fs::write(&prompt_file, request.prompt)?;
+
+    if cfg!(target_os = "windows") {
+        let ps_script = build_ps_script_resume(&cli_path, request);
+        let script_file = work_dir.join("run.ps1");
+        fs::write(&script_file, &ps_script)?;
+
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &script_file.to_string_lossy(),
+        ])
+        .current_dir(work_dir);
+
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        execute_command(cmd, work_dir)
+    } else {
+        let shell_script = build_shell_script_resume(&cli_path, request);
+        let script_file = work_dir.join("run.sh");
+        fs::write(&script_file, &shell_script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_file)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_file, perms)?;
+        }
+
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script_file).current_dir(work_dir);
+
+        execute_command(cmd, work_dir)
+    }
 }
 
 /// Run Gemini CLI on Windows using PowerShell
@@ -243,13 +490,60 @@ fn run_gemini_unix(
     execute_command(cmd, work_dir)
 }
 
-/// Execute the command and process output
+/// Default timeout for CLI execution (90 seconds)
+const CLI_TIMEOUT_SECS: u64 = 90;
+
+/// Run a command with a timeout. Returns Output or Error on timeout/spawn failure.
+fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<std::process::Output> {
+    use std::time::{Duration, Instant};
+    use std::io::Read;
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| Error::GeminiError(format!("spawn failed: {}", e)))?;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process finished - collect output
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output { status, stdout, stderr });
+            }
+            Ok(None) => {
+                // Still running - check timeout
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::GeminiError(format!(
+                        "CLI timed out after {}s", timeout_secs
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                return Err(Error::GeminiError(format!("wait failed: {}", e)));
+            }
+        }
+    }
+}
+
+/// Execute the command and process output (with timeout)
 fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
     // Debug: write command info
     let debug_path = work_dir.join("debug.log");
     let _ = fs::write(&debug_path, format!("Command: {:?}\nWorkDir: {:?}\n", cmd, work_dir));
 
-    let output = cmd.output()?;
+    let output = run_with_timeout(&mut cmd, CLI_TIMEOUT_SECS)?;
 
     // Debug: append output info
     let debug_info = format!(
@@ -270,7 +564,17 @@ fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
 
     if output.status.success() {
         let result = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(clean_ai_output(&result))
+        let cleaned = clean_ai_output(&result);
+
+        // Gemini CLI sometimes exits 0 but writes errors to stderr with empty stdout
+        if cleaned.is_empty() && !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let detail = format!("CLI returned empty output. Stderr: {}", stderr.trim());
+            write_error_log(work_dir, &detail);
+            return Err(Error::GeminiError(detail));
+        }
+
+        Ok(cleaned)
     } else {
         let status = output
             .status
@@ -309,20 +613,27 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
 
     // Build model option - use default if model is empty
     let model = if request.model.is_empty() {
-        "gemini-2.5-flash"
+        "gemini-3-flash-preview"
     } else {
         request.model
     };
     let model_opt = format!("-m {} ", model);
 
     if let Some(files) = request.files {
-        // Use @filename syntax to reference files in gemini CLI
-        // File reference first, then prompt (matches successful manual test)
-        let file_refs = files
-            .iter()
-            .map(|f| format!("@{}", f.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Copy files to work dir with neutral names to prevent filename hints leaking to AI.
+        // E.g. "isuzu_white_light_load.jpg" → "image_0.jpg"
+        let mut copy_cmds = Vec::new();
+        let mut neutral_refs = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let ext = Path::new(f).extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+            let neutral = format!("image_{}.{}", i, ext);
+            copy_cmds.push(format!("Copy-Item '{}' '{}'", f.replace('\'', "''"), neutral));
+            neutral_refs.push(format!("@{}", neutral));
+        }
+        let file_refs = neutral_refs.join(" ");
+        let copy_section = copy_cmds.join("\n");
 
         // Build JSON suffix based on partial_json or output_format
         let json_suffix = if let Some(partial) = request.partial_json {
@@ -333,13 +644,21 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
             String::new()
         };
 
+        // Combine @file refs + prompt into stdin (no -p flag).
+        // Gemini CLI auto-detects headless mode when stdin is piped.
+        // Using -p with stdin triggers "Cannot use both positional and --prompt" error.
         format!(
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+{copy_section}
 $prompt = Get-Content -Raw -Encoding UTF8 'prompt.txt'
-$fullPrompt = "{} " + $prompt + "{}"
-& '{}' {}--yolo -o {} -p $fullPrompt
+("{file_refs} " + $prompt + "{suffix}") | & '{gemini}' {model}--yolo -o {fmt}
 "#,
-            file_refs, json_suffix, gemini_path, model_opt, output_format
+            copy_section = copy_section,
+            file_refs = file_refs,
+            gemini = gemini_path,
+            model = model_opt,
+            fmt = output_format,
+            suffix = json_suffix,
         )
     } else {
         format!(
@@ -358,19 +677,26 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
 
     // Build model option - use default if model is empty
     let model = if request.model.is_empty() {
-        "gemini-2.5-flash"
+        "gemini-3-flash-preview"
     } else {
         request.model
     };
     let model_opt = format!("-m {} ", model);
 
     if let Some(files) = request.files {
-        // Use @filename syntax to reference files in gemini CLI
-        let file_refs = files
-            .iter()
-            .map(|f| format!("@{}", f.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Copy files with neutral names to prevent filename hints leaking to AI
+        let mut copy_cmds = Vec::new();
+        let mut neutral_refs = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let ext = Path::new(f).extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+            let neutral = format!("image_{}.{}", i, ext);
+            copy_cmds.push(format!("cp '{}' '{}'", f.replace('\'', "'\\''"), neutral));
+            neutral_refs.push(format!("@{}", neutral));
+        }
+        let file_refs = neutral_refs.join(" ");
+        let copy_section = copy_cmds.join("\n");
 
         // Build JSON suffix based on partial_json or output_format
         let json_suffix = if let Some(partial) = request.partial_json {
@@ -381,12 +707,20 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
             String::new()
         };
 
+        // Combine @file refs + prompt into stdin (no -p flag).
+        // Gemini CLI auto-detects headless mode when stdin is piped.
         format!(
             r#"#!/bin/bash
+{copy_section}
 prompt=$(cat prompt.txt)
-'{}' {}--yolo -o {} -p "{} $prompt{}"
+echo "{file_refs} $prompt{suffix}" | '{gemini}' {model}--yolo -o {fmt}
 "#,
-            gemini_path, model_opt, output_format, file_refs, json_suffix
+            copy_section = copy_section,
+            file_refs = file_refs,
+            gemini = gemini_path,
+            model = model_opt,
+            fmt = output_format,
+            suffix = json_suffix,
         )
     } else {
         format!(
@@ -396,6 +730,69 @@ cat prompt.txt | '{}' {}-o {}
             gemini_path, model_opt, output_format
         )
     }
+}
+
+/// Build PowerShell script for Gemini resume (--resume latest, no file refs)
+fn build_ps_script_resume(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
+    let gemini_path = gemini_path.replace('\'', "''");
+    let output_format = "text";
+
+    let model = if request.model.is_empty() {
+        "gemini-3-flash-preview"
+    } else {
+        request.model
+    };
+    let model_opt = format!("-m {} ", model);
+
+    let json_suffix = if let Some(partial) = request.partial_json {
+        format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "`\""))
+    } else if request.output_format == OutputFormat::Json {
+        " Respond with ONLY the JSON object.".to_string()
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+$prompt = Get-Content -Raw -Encoding UTF8 'prompt.txt'
+($prompt + "{suffix}") | & '{gemini}' {model}--resume latest --yolo -o {fmt}
+"#,
+        gemini = gemini_path,
+        model = model_opt,
+        fmt = output_format,
+        suffix = json_suffix,
+    )
+}
+
+/// Build shell script for Gemini resume (--resume latest, no file refs)
+fn build_shell_script_resume(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
+    let output_format = "text";
+
+    let model = if request.model.is_empty() {
+        "gemini-3-flash-preview"
+    } else {
+        request.model
+    };
+    let model_opt = format!("-m {} ", model);
+
+    let json_suffix = if let Some(partial) = request.partial_json {
+        format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "\\\""))
+    } else if request.output_format == OutputFormat::Json {
+        " Respond with ONLY the JSON object.".to_string()
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"#!/bin/bash
+prompt=$(cat prompt.txt)
+echo "$prompt{suffix}" | '{gemini}' {model}--resume latest --yolo -o {fmt}
+"#,
+        gemini = gemini_path,
+        model = model_opt,
+        fmt = output_format,
+        suffix = json_suffix,
+    )
 }
 
 /// Run Claude CLI on Windows using PowerShell
@@ -924,9 +1321,9 @@ mod tests {
 
     #[test]
     fn test_gemini_request_text() {
-        let req = AiRequest::text("test prompt", "gemini-2.5-flash");
+        let req = AiRequest::text("test prompt", "gemini-3-flash-preview");
         assert_eq!(req.prompt, "test prompt");
-        assert_eq!(req.model, "gemini-2.5-flash");
+        assert_eq!(req.model, "gemini-3-flash-preview");
         assert!(req.files.is_none());
         assert_eq!(req.output_format, OutputFormat::Text);
         assert_eq!(req.backend, Backend::Gemini);
@@ -935,7 +1332,7 @@ mod tests {
     #[test]
     fn test_gemini_request_json_with_files() {
         let files = vec!["a.pdf".to_string(), "b.pdf".to_string()];
-        let req = AiRequest::json_with_files("test", "gemini-2.5-flash", &files);
+        let req = AiRequest::json_with_files("test", "gemini-3-flash-preview", &files);
         assert!(req.files.is_some());
         assert_eq!(req.output_format, OutputFormat::Json);
     }
@@ -1012,6 +1409,7 @@ mod tests {
             output_format: OutputFormat::Text,
             backend: Backend::Claude,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         };
         let script = build_claude_shell_script("claude", &req);
         assert!(script.contains("claude"));
@@ -1031,6 +1429,7 @@ mod tests {
             output_format: OutputFormat::Text,
             backend: Backend::Claude,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         };
         let script = build_claude_shell_script("claude", &req);
         assert!(script.contains("--file"));
@@ -1057,6 +1456,7 @@ mod tests {
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         };
         let script = build_codex_shell_script("codex", &req);
         assert!(script.contains("codex"));
@@ -1076,6 +1476,7 @@ mod tests {
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         };
         let prompt = build_codex_prompt(&req).unwrap();
         assert_eq!(prompt, "test prompt");
@@ -1090,6 +1491,7 @@ mod tests {
             output_format: OutputFormat::Text,
             backend: Backend::Codex,
             partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
         };
         let script = build_codex_ps_script("codex", &req);
         assert!(script.contains("codex"));
@@ -1098,5 +1500,270 @@ mod tests {
         // Now uses stdin with '-' instead of quoted prompt
         assert!(script.contains("Get-Content -Raw -Encoding UTF8 'prompt.txt'"));
         assert!(script.contains(" -"));
+    }
+
+    #[test]
+    fn test_clean_ai_output_empty_triggers_stderr_path() {
+        // When AI output is empty after cleaning, execute_command checks stderr
+        assert_eq!(clean_ai_output(""), "");
+        assert_eq!(clean_ai_output("   "), "");
+        assert_eq!(clean_ai_output("Loaded cached credentials\nHook registry initialized"), "");
+        // Non-empty output would not trigger stderr check
+        assert!(!clean_ai_output("actual response").is_empty());
+    }
+
+    // === Regression tests: Gemini CLI v0.27.0 rejects "-p" when stdin is piped ===
+    // The old build_ps_script() put @file.jpg references inside a -p flag argument,
+    // which caused "Cannot use both positional and --prompt" errors. The fix was to
+    // pipe everything through stdin without -p. These tests guard against that regression.
+
+    #[test]
+    fn test_build_ps_script_with_files_uses_stdin_not_p() {
+        let files = vec!["C:\\path\\to\\descriptive_name.jpg".to_string()];
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "gemini-2.5-pro",
+            files: Some(&files),
+            output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_ps_script("gemini.cmd", &req);
+
+        // Must copy file with neutral name to prevent filename hints leaking to AI
+        assert!(
+            script.contains("Copy-Item") && script.contains("image_0.jpg"),
+            "PS script must copy files with neutral names, got: {}",
+            script
+        );
+
+        // Must use neutral @filename, NOT the original descriptive name
+        assert!(
+            script.contains("@image_0.jpg"),
+            "PS script must use neutral @filename reference, got: {}",
+            script
+        );
+        assert!(
+            !script.contains("@C:\\") && !script.contains("@descriptive_name"),
+            "PS script must NOT leak original filename in @ reference, got: {}",
+            script
+        );
+
+        // Must NOT contain -p flag (Gemini CLI v0.27.0 rejects -p with piped stdin)
+        assert!(
+            !script.contains(" -p "),
+            "PS script with files must NOT use -p flag (breaks Gemini CLI v0.27.0), got: {}",
+            script
+        );
+
+        // Must pipe content through stdin using PowerShell pipe operator
+        assert!(
+            script.contains("| &"),
+            "PS script with files must pipe content via stdin (| &), got: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn test_build_shell_script_with_files_uses_stdin_not_p() {
+        let files = vec!["/path/to/descriptive_name.jpg".to_string()];
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "gemini-2.5-pro",
+            files: Some(&files),
+            output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_shell_script("gemini", &req);
+
+        // Must copy file with neutral name
+        assert!(
+            script.contains("cp ") && script.contains("image_0.jpg"),
+            "Shell script must copy files with neutral names, got: {}",
+            script
+        );
+
+        // Must use neutral @filename, NOT the original descriptive name
+        assert!(
+            script.contains("@image_0.jpg"),
+            "Shell script must use neutral @filename reference, got: {}",
+            script
+        );
+        assert!(
+            !script.contains("@descriptive_name"),
+            "Shell script must NOT leak original filename in @ reference, got: {}",
+            script
+        );
+
+        // Must NOT contain -p flag (Gemini CLI v0.27.0 rejects -p with piped stdin)
+        assert!(
+            !script.contains(" -p "),
+            "Shell script with files must NOT use -p flag (breaks Gemini CLI v0.27.0), got: {}",
+            script
+        );
+
+        // Must pipe content through stdin using echo
+        assert!(
+            script.contains("echo"),
+            "Shell script with files must pipe content via echo, got: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn test_build_ps_script_no_files_uses_stdin() {
+        let req = AiRequest {
+            prompt: "test prompt",
+            model: "gemini-2.5-pro",
+            files: None,
+            output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_ps_script("gemini.cmd", &req);
+
+        // No-files case still pipes prompt.txt through stdin
+        assert!(
+            script.contains("Get-Content"),
+            "PS script without files must pipe prompt.txt via Get-Content, got: {}",
+            script
+        );
+        assert!(
+            script.contains("| &"),
+            "PS script without files must pipe to gemini via | &, got: {}",
+            script
+        );
+
+        // Must NOT contain -p flag even without files
+        assert!(
+            !script.contains(" -p "),
+            "PS script without files must NOT use -p flag, got: {}",
+            script
+        );
+    }
+
+    // === Resume script tests ===
+
+    #[test]
+    fn test_build_ps_script_resume_no_file_refs() {
+        let req = AiRequest {
+            prompt: "estimate fill ratios",
+            model: "gemini-3-flash-preview",
+            files: None,
+            output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_ps_script_resume("gemini.cmd", &req);
+
+        // Must contain --resume latest
+        assert!(
+            script.contains("--resume latest"),
+            "Resume PS script must contain --resume latest, got: {}",
+            script
+        );
+
+        // Must NOT contain @image references
+        assert!(
+            !script.contains("@image"),
+            "Resume PS script must NOT contain @image refs, got: {}",
+            script
+        );
+
+        // Must NOT contain Copy-Item (no file copying)
+        assert!(
+            !script.contains("Copy-Item"),
+            "Resume PS script must NOT contain Copy-Item, got: {}",
+            script
+        );
+
+        // Must contain --yolo
+        assert!(
+            script.contains("--yolo"),
+            "Resume PS script must contain --yolo, got: {}",
+            script
+        );
+
+        // Must contain JSON suffix for Json output format
+        assert!(
+            script.contains("Respond with ONLY the JSON object"),
+            "Resume PS script with Json format must contain JSON suffix, got: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn test_build_shell_script_resume_no_file_refs() {
+        let req = AiRequest {
+            prompt: "estimate fill ratios",
+            model: "gemini-3-flash-preview",
+            files: None,
+            output_format: OutputFormat::Json,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_shell_script_resume("gemini", &req);
+
+        // Must contain --resume latest
+        assert!(
+            script.contains("--resume latest"),
+            "Resume shell script must contain --resume latest, got: {}",
+            script
+        );
+
+        // Must NOT contain @image references
+        assert!(
+            !script.contains("@image"),
+            "Resume shell script must NOT contain @image refs, got: {}",
+            script
+        );
+
+        // Must NOT contain cp (no file copying)
+        assert!(
+            !script.contains("cp '"),
+            "Resume shell script must NOT contain cp file copy, got: {}",
+            script
+        );
+
+        // Must contain --yolo
+        assert!(
+            script.contains("--yolo"),
+            "Resume shell script must contain --yolo, got: {}",
+            script
+        );
+
+        // Must contain JSON suffix for Json output format
+        assert!(
+            script.contains("Respond with ONLY the JSON object"),
+            "Resume shell script with Json format must contain JSON suffix, got: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn test_build_ps_script_resume_text_format_no_json_suffix() {
+        let req = AiRequest {
+            prompt: "describe the truck",
+            model: "gemini-3-flash-preview",
+            files: None,
+            output_format: OutputFormat::Text,
+            backend: Backend::Gemini,
+            partial_json: None,
+            usage_mode: UsageMode::TimeBasedQuota,
+        };
+        let script = build_ps_script_resume("gemini.cmd", &req);
+
+        assert!(script.contains("--resume latest"));
+        assert!(
+            !script.contains("Respond with ONLY"),
+            "Resume PS script with Text format must NOT contain JSON suffix, got: {}",
+            script
+        );
     }
 }
