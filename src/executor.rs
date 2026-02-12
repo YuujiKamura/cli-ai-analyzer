@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -159,52 +160,62 @@ pub fn run_ai(
     work_dir: &Path,
     request: &AiRequest<'_>,
     custom_cli_path: Option<&str>,
+    profile_path: Option<&Path>,
 ) -> Result<String> {
-    // PayPerUse mode: call Gemini REST API directly (Gemini backend only)
-    if request.usage_mode == UsageMode::PayPerUse {
-        if request.backend != Backend::Gemini {
-            return Err(Error::GeminiError(
-                "PayPerUse mode is only supported for Gemini backend.".into(),
-            ));
+    let start = Instant::now();
+    let result = (|| {
+        // PayPerUse mode: call Gemini REST API directly (Gemini backend only)
+        if request.usage_mode == UsageMode::PayPerUse {
+            if request.backend != Backend::Gemini {
+                return Err(Error::GeminiError(
+                    "PayPerUse mode is only supported for Gemini backend.".into(),
+                ));
+            }
+            return run_gemini_rest_api(work_dir, request);
         }
-        return run_gemini_rest_api(work_dir, request);
+
+        let cli_path = cli_cmd_path(request.backend, custom_cli_path);
+
+        // Build and execute script based on backend
+        match request.backend {
+            Backend::Gemini => {
+                // Write prompt to file for Gemini (uses stdin)
+                let prompt_file = work_dir.join("prompt.txt");
+                fs::write(&prompt_file, request.prompt)?;
+
+                if cfg!(target_os = "windows") {
+                    run_gemini_windows(work_dir, &cli_path, request)
+                } else {
+                    run_gemini_unix(work_dir, &cli_path, request)
+                }
+            }
+            Backend::Claude => {
+                // Claude uses -p flag for prompt
+                if cfg!(target_os = "windows") {
+                    run_claude_windows(work_dir, &cli_path, request)
+                } else {
+                    run_claude_unix(work_dir, &cli_path, request)
+                }
+            }
+            Backend::Codex => {
+                // Codex uses exec subcommand with prompt as argument
+                if cfg!(target_os = "windows") {
+                    run_codex_windows(work_dir, &cli_path, request)
+                } else {
+                    run_codex_unix(work_dir, &cli_path, request)
+                }
+            }
+            Backend::Ollama => {
+                Err(Error::GeminiError("Ollama backend is not yet implemented".to_string()))
+            }
+        }
+    })();
+
+    if let Some(path) = profile_path {
+        let _ = write_profile(path, request, start.elapsed(), result.as_ref().err(), false);
     }
 
-    let cli_path = cli_cmd_path(request.backend, custom_cli_path);
-
-    // Build and execute script based on backend
-    match request.backend {
-        Backend::Gemini => {
-            // Write prompt to file for Gemini (uses stdin)
-            let prompt_file = work_dir.join("prompt.txt");
-            fs::write(&prompt_file, request.prompt)?;
-
-            if cfg!(target_os = "windows") {
-                run_gemini_windows(work_dir, &cli_path, request)
-            } else {
-                run_gemini_unix(work_dir, &cli_path, request)
-            }
-        }
-        Backend::Claude => {
-            // Claude uses -p flag for prompt
-            if cfg!(target_os = "windows") {
-                run_claude_windows(work_dir, &cli_path, request)
-            } else {
-                run_claude_unix(work_dir, &cli_path, request)
-            }
-        }
-        Backend::Codex => {
-            // Codex uses exec subcommand with prompt as argument
-            if cfg!(target_os = "windows") {
-                run_codex_windows(work_dir, &cli_path, request)
-            } else {
-                run_codex_unix(work_dir, &cli_path, request)
-            }
-        }
-        Backend::Ollama => {
-            Err(Error::GeminiError("Ollama backend is not yet implemented".to_string()))
-        }
-    }
+    result
 }
 
 /// Run Gemini REST API directly (PayPerUse mode)
@@ -380,7 +391,7 @@ pub fn run_gemini(
     request: &GeminiRequest<'_>,
     custom_gemini_path: Option<&str>,
 ) -> Result<String> {
-    run_ai(work_dir, request, custom_gemini_path)
+    run_ai(work_dir, request, custom_gemini_path, None)
 }
 
 /// Run AI CLI with `--resume latest` to continue an existing Gemini session.
@@ -389,11 +400,13 @@ pub(crate) fn run_ai_resume(
     work_dir: &Path,
     request: &AiRequest<'_>,
     custom_cli_path: Option<&str>,
+    profile_path: Option<&Path>,
 ) -> Result<String> {
     if request.backend != Backend::Gemini {
-        return run_ai(work_dir, request, custom_cli_path);
+        return run_ai(work_dir, request, custom_cli_path, profile_path);
     }
 
+    let start = Instant::now();
     let cli_path = cli_cmd_path(request.backend, custom_cli_path);
 
     // Write prompt to file
@@ -418,7 +431,11 @@ pub(crate) fn run_ai_resume(
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        execute_command(cmd, work_dir)
+        let result = execute_command(cmd, work_dir);
+        if let Some(path) = profile_path {
+            let _ = write_profile(path, request, start.elapsed(), result.as_ref().err(), true);
+        }
+        result
     } else {
         let shell_script = build_shell_script_resume(&cli_path, request);
         let script_file = work_dir.join("run.sh");
@@ -435,8 +452,48 @@ pub(crate) fn run_ai_resume(
         let mut cmd = Command::new("bash");
         cmd.arg(&script_file).current_dir(work_dir);
 
-        execute_command(cmd, work_dir)
+        let result = execute_command(cmd, work_dir);
+        if let Some(path) = profile_path {
+            let _ = write_profile(path, request, start.elapsed(), result.as_ref().err(), true);
+        }
+        result
     }
+}
+
+fn write_profile(
+    profile_path: &Path,
+    request: &AiRequest<'_>,
+    duration: Duration,
+    error: Option<&Error>,
+    resumed: bool,
+) -> Result<()> {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis();
+
+    let file_count = request.files.map(|f| f.len()).unwrap_or(0);
+    let record = serde_json::json!({
+        "ts_ms": ts_ms,
+        "duration_ms": duration.as_millis(),
+        "backend": format!("{:?}", request.backend),
+        "model": request.model,
+        "output_format": format!("{:?}", request.output_format),
+        "usage_mode": format!("{:?}", request.usage_mode),
+        "file_count": file_count,
+        "resumed": resumed,
+        "ok": error.is_none(),
+        "error": error.map(|e| e.to_string()).unwrap_or_default(),
+    });
+
+    let line = format!("{}\n", record);
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile_path)?;
+    use std::io::Write;
+    f.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 /// Run Gemini CLI on Windows using PowerShell
@@ -490,8 +547,8 @@ fn run_gemini_unix(
     execute_command(cmd, work_dir)
 }
 
-/// Default timeout for CLI execution (90 seconds)
-const CLI_TIMEOUT_SECS: u64 = 90;
+/// Default timeout for CLI execution (180 seconds)
+const CLI_TIMEOUT_SECS: u64 = 180;
 
 /// Run a command with a timeout. Returns Output or Error on timeout/spawn failure.
 fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<std::process::Output> {

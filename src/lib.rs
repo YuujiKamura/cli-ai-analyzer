@@ -41,17 +41,21 @@
 
 mod backend;
 mod error;
+pub mod estimate;
 mod executor;
 mod temp;
 
-pub use backend::Backend;
+pub use backend::{Backend, UsageMode};
 pub use error::{Error, Result};
 pub use executor::{AiRequest, GeminiRequest, GeminiStats, OutputFormat, get_gemini_stats, check_gemini_status};
 
-use std::path::Path;
+// Re-export temp utilities for session use (crate-internal)
+// AnalysisSession is the public API
+
+use std::path::{Path, PathBuf};
 
 /// Default Gemini model
-pub const DEFAULT_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_MODEL: &str = "gemini-3-flash-preview";
 
 /// Default Claude model
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
@@ -69,6 +73,10 @@ pub struct AnalyzeOptions {
     pub backend: Backend,
     /// Partial JSON with null values to fill in
     pub partial_json: Option<String>,
+    /// Usage mode (billing model)
+    pub usage_mode: UsageMode,
+    /// Optional profile JSONL output path
+    pub profile_path: Option<PathBuf>,
 }
 
 impl Default for AnalyzeOptions {
@@ -79,6 +87,10 @@ impl Default for AnalyzeOptions {
             cli_path: None,
             backend: Backend::default(),
             partial_json: None,
+            usage_mode: UsageMode::default(),
+            profile_path: std::env::var("CLI_AI_ANALYZER_PROFILE_PATH")
+                .ok()
+                .map(PathBuf::from),
         }
     }
 }
@@ -129,6 +141,18 @@ impl AnalyzeOptions {
     /// Set partial JSON with null values to fill in
     pub fn with_partial_json(mut self, partial_json: impl Into<String>) -> Self {
         self.partial_json = Some(partial_json.into());
+        self
+    }
+
+    /// Set usage mode (billing model)
+    pub fn with_usage_mode(mut self, usage_mode: UsageMode) -> Self {
+        self.usage_mode = usage_mode;
+        self
+    }
+
+    /// Set profile JSONL output path
+    pub fn with_profile_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.profile_path = Some(path.into());
         self
     }
 }
@@ -233,9 +257,15 @@ pub fn analyze_in_dir<P: AsRef<Path>>(
         output_format: options.output_format,
         backend: options.backend,
         partial_json: partial_json_ref,
+        usage_mode: options.usage_mode,
     };
 
-    executor::run_ai(work_dir, &request, options.cli_path.as_deref())
+    executor::run_ai(
+        work_dir,
+        &request,
+        options.cli_path.as_deref(),
+        options.profile_path.as_deref(),
+    )
 }
 
 /// Run a prompt without files in a specific directory
@@ -248,9 +278,15 @@ pub fn prompt_in_dir(work_dir: &Path, prompt: &str, options: AnalyzeOptions) -> 
         output_format: options.output_format,
         backend: options.backend,
         partial_json: partial_json_ref,
+        usage_mode: options.usage_mode,
     };
 
-    executor::run_ai(work_dir, &request, options.cli_path.as_deref())
+    executor::run_ai(
+        work_dir,
+        &request,
+        options.cli_path.as_deref(),
+        options.profile_path.as_deref(),
+    )
 }
 
 /// Builder for complex analysis requests
@@ -321,6 +357,18 @@ impl AnalysisBuilder {
         self
     }
 
+    /// Set usage mode (billing model)
+    pub fn usage_mode(mut self, usage_mode: UsageMode) -> Self {
+        self.options.usage_mode = usage_mode;
+        self
+    }
+
+    /// Set profile JSONL output path
+    pub fn profile_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.options.profile_path = Some(path.into());
+        self
+    }
+
     /// Execute the analysis
     pub fn run(self) -> Result<String> {
         if self.files.is_empty() {
@@ -328,6 +376,83 @@ impl AnalysisBuilder {
         } else {
             analyze(&self.prompt, &self.files, self.options)
         }
+    }
+}
+
+/// A session that keeps a Gemini CLI session alive across turns.
+///
+/// The first turn uploads files (images) and starts a new Gemini session.
+/// Subsequent turns use `--resume 0` to continue the same session,
+/// avoiding re-uploading images.
+///
+/// Non-Gemini backends fall back to normal `analyze()` on every turn.
+pub struct AnalysisSession {
+    work_dir: PathBuf,
+    options: AnalyzeOptions,
+    turn_count: usize,
+}
+
+impl AnalysisSession {
+    /// Create a new session with a temporary work directory.
+    pub fn new(options: AnalyzeOptions) -> Result<Self> {
+        let work_dir = temp::create_temp_dir("cli-ai-session")?;
+        Ok(Self {
+            work_dir,
+            options,
+            turn_count: 0,
+        })
+    }
+
+    /// Execute the first turn with files (e.g. image upload).
+    /// This starts a new Gemini session. Must be called exactly once.
+    pub fn first_turn<P: AsRef<Path>>(&mut self, prompt: &str, files: &[P]) -> Result<String> {
+        if self.turn_count > 0 {
+            return Err(Error::GeminiError(
+                "first_turn() can only be called once per session".into(),
+            ));
+        }
+        self.turn_count = 1;
+        analyze_in_dir(&self.work_dir, prompt, files, self.options.clone())
+    }
+
+    /// Execute a subsequent turn using `--resume 0` (no file re-upload).
+    /// Must be called after `first_turn()`.
+    pub fn next_turn(&mut self, prompt: &str) -> Result<String> {
+        if self.turn_count == 0 {
+            return Err(Error::GeminiError(
+                "next_turn() requires first_turn() to be called first".into(),
+            ));
+        }
+        self.turn_count += 1;
+
+        let partial_json_ref = self.options.partial_json.as_deref();
+        let request = AiRequest {
+            prompt,
+            model: &self.options.model,
+            files: None,
+            output_format: self.options.output_format,
+            backend: self.options.backend,
+            partial_json: partial_json_ref,
+            usage_mode: self.options.usage_mode,
+        };
+
+        executor::run_ai_resume(
+            &self.work_dir,
+            &request,
+            self.options.cli_path.as_deref(),
+            self.options.profile_path.as_deref(),
+        )
+    }
+
+    /// Number of turns completed so far.
+    pub fn turn_count(&self) -> usize {
+        self.turn_count
+    }
+}
+
+impl Drop for AnalysisSession {
+    fn drop(&mut self) {
+        temp::cleanup_temp_dir(&self.work_dir);
     }
 }
 
@@ -389,5 +514,39 @@ mod tests {
 
         assert_eq!(builder.options.backend, Backend::Claude);
         assert_eq!(builder.options.model, DEFAULT_CLAUDE_MODEL);
+    }
+
+    // === AnalysisSession tests ===
+
+    #[test]
+    fn test_session_creation() {
+        let session = AnalysisSession::new(AnalyzeOptions::default()).unwrap();
+        assert_eq!(session.turn_count(), 0);
+        assert!(session.work_dir.exists());
+    }
+
+    #[test]
+    fn test_session_next_turn_before_first_fails() {
+        let mut session = AnalysisSession::new(AnalyzeOptions::default()).unwrap();
+        let err = session.next_turn("test prompt");
+        assert!(err.is_err());
+        let err_msg = err.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("first_turn()"),
+            "Expected error about first_turn, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_session_drop_cleans_up() {
+        let work_dir;
+        {
+            let session = AnalysisSession::new(AnalyzeOptions::default()).unwrap();
+            work_dir = session.work_dir.clone();
+            assert!(work_dir.exists());
+        }
+        // After drop, work_dir should be cleaned up
+        assert!(!work_dir.exists());
     }
 }

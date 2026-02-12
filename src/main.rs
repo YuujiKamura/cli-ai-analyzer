@@ -25,7 +25,8 @@
 //! ```
 
 use clap::{Parser, Subcommand, ValueEnum};
-use cli_ai_analyzer::{analyze, prompt, AnalyzeOptions, Backend, OutputFormat};
+use cli_ai_analyzer::estimate::{self, EstimateOptions};
+use cli_ai_analyzer::{analyze, prompt, AnalyzeOptions, Backend, OutputFormat, UsageMode};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -89,6 +90,10 @@ enum Commands {
         /// Custom CLI path
         #[arg(long)]
         cli_path: Option<String>,
+
+        /// Use PayPerUse mode (Gemini REST API with GEMINI_API_KEY)
+        #[arg(long)]
+        pay_per_use: bool,
     },
 
     /// Send a text-only prompt (no files)
@@ -112,6 +117,10 @@ enum Commands {
         /// Custom CLI path
         #[arg(long)]
         cli_path: Option<String>,
+
+        /// Use PayPerUse mode (Gemini REST API with GEMINI_API_KEY)
+        #[arg(long)]
+        pay_per_use: bool,
     },
 
     /// Check files with a document verification prompt (Japanese)
@@ -136,6 +145,41 @@ enum Commands {
         /// Custom CLI path
         #[arg(long)]
         cli_path: Option<String>,
+    },
+
+    /// Estimate dump truck cargo weight from image
+    #[command(alias = "e")]
+    Estimate {
+        /// Image file to analyze
+        image_path: PathBuf,
+
+        /// Truck class (2t, 4t, 増トン, 10t)
+        #[arg(short = 't', long, default_value = "4t")]
+        truck_class: String,
+
+        /// Material type (土砂, As殻, Co殻, 開粒度As殻)
+        #[arg(short = 'M', long, default_value = "As殻")]
+        material: String,
+
+        /// Number of ensemble runs for geometry/fill detection
+        #[arg(short = 'n', long, default_value = "2")]
+        ensemble: usize,
+
+        /// Model to use (default depends on backend)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Backend to use (gemini, claude)
+        #[arg(short, long, value_enum, default_value = "gemini")]
+        backend: BackendArg,
+
+        /// Custom CLI path
+        #[arg(long)]
+        cli_path: Option<String>,
+
+        /// Use PayPerUse mode (Gemini REST API with GEMINI_API_KEY)
+        #[arg(long)]
+        pay_per_use: bool,
     },
 
     /// Compare multiple files for consistency
@@ -174,6 +218,7 @@ fn main() -> ExitCode {
             backend,
             json,
             cli_path,
+            pay_per_use,
         } => {
             // Validate files exist
             for file in &files {
@@ -195,6 +240,9 @@ fn main() -> ExitCode {
             if let Some(path) = cli_path {
                 options.cli_path = Some(path);
             }
+            if pay_per_use {
+                options.usage_mode = UsageMode::PayPerUse;
+            }
 
             analyze(&prompt_text, &files, options)
         }
@@ -205,6 +253,7 @@ fn main() -> ExitCode {
             backend,
             json,
             cli_path,
+            pay_per_use,
         } => {
             let backend: Backend = backend.into();
             let mut options = if let Some(m) = model {
@@ -217,6 +266,9 @@ fn main() -> ExitCode {
             }
             if let Some(path) = cli_path {
                 options.cli_path = Some(path);
+            }
+            if pay_per_use {
+                options.usage_mode = UsageMode::PayPerUse;
             }
 
             prompt(&prompt_text, options)
@@ -249,6 +301,54 @@ fn main() -> ExitCode {
             }
 
             analyze(&prompt_text, &files, options)
+        }
+
+        Commands::Estimate {
+            image_path,
+            truck_class,
+            material,
+            ensemble,
+            model,
+            backend,
+            cli_path,
+            pay_per_use,
+        } => {
+            if !image_path.exists() {
+                eprintln!("Error: File not found: {}", image_path.display());
+                return ExitCode::from(1);
+            }
+
+            let backend: Backend = backend.into();
+            let mut options = if let Some(m) = model {
+                AnalyzeOptions::with_model(m).with_backend(backend)
+            } else {
+                AnalyzeOptions::default().with_backend(backend)
+            };
+            if let Some(path) = cli_path {
+                options.cli_path = Some(path);
+            }
+            if pay_per_use {
+                options.usage_mode = UsageMode::PayPerUse;
+            }
+
+            let est_options = EstimateOptions {
+                truck_class,
+                material,
+                ensemble,
+                analyze_options: options,
+            };
+
+            match estimate::estimate(&image_path, est_options) {
+                Ok(result) => {
+                    match serde_json::to_string_pretty(&result) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(cli_ai_analyzer::Error::GeminiError(
+                            format!("JSON serialize error: {}", e),
+                        )),
+                    }
+                }
+                Err(e) => Err(e),
+            }
         }
 
         Commands::Compare {
