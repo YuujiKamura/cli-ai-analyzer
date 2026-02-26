@@ -930,6 +930,7 @@ fn build_claude_ps_script(claude_path: &str, request: &AiRequest<'_>) -> String 
     // Build base command
     let mut script = format!(
         r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+Remove-Item Env:\CLAUDECODE -ErrorAction SilentlyContinue
 "#
     );
 
@@ -973,6 +974,7 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
             .join(" ");
         format!(
             r#"#!/bin/bash
+unset CLAUDECODE
 '{}' -p '{}' --model {} --output-format text --file {}
 "#,
             claude_path, prompt, model, file_args
@@ -980,6 +982,7 @@ fn build_claude_shell_script(claude_path: &str, request: &AiRequest<'_>) -> Stri
     } else {
         format!(
             r#"#!/bin/bash
+unset CLAUDECODE
 '{}' -p '{}' --model {} --output-format text
 "#,
             claude_path, prompt, model
@@ -1029,6 +1032,7 @@ fn build_claude_ps_script_stdin(claude_path: &str, request: &AiRequest<'_>) -> S
 
         format!(
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+Remove-Item Env:\CLAUDECODE -ErrorAction SilentlyContinue
 $files = @({})
 Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -p - --model {} --output-format text --file $files
 "#,
@@ -1037,6 +1041,7 @@ Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -p - --model {} --output-f
     } else {
         format!(
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
+Remove-Item Env:\CLAUDECODE -ErrorAction SilentlyContinue
 Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' -p - --model {} --output-format text
 "#,
             claude_path, model
@@ -1057,6 +1062,7 @@ fn build_claude_shell_script_stdin(claude_path: &str, request: &AiRequest<'_>) -
             .join(" ");
         format!(
             r#"#!/bin/bash
+unset CLAUDECODE
 cat prompt.txt | '{}' -p - --model {} --output-format text --file {}
 "#,
             claude_path, model, file_args
@@ -1064,6 +1070,7 @@ cat prompt.txt | '{}' -p - --model {} --output-format text --file {}
     } else {
         format!(
             r#"#!/bin/bash
+unset CLAUDECODE
 cat prompt.txt | '{}' -p - --model {} --output-format text
 "#,
             claude_path, model
