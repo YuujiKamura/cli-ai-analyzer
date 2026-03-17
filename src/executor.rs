@@ -708,7 +708,7 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
             r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
 {copy_section}
 $prompt = Get-Content -Raw -Encoding UTF8 'prompt.txt'
-("{file_refs} " + $prompt + "{suffix}") | & '{gemini}' {model}--yolo -o {fmt}
+("{file_refs} " + $prompt + "{suffix}") | & '{gemini}' {model}-o {fmt}
 "#,
             copy_section = copy_section,
             file_refs = file_refs,
@@ -770,7 +770,7 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
             r#"#!/bin/bash
 {copy_section}
 prompt=$(cat prompt.txt)
-echo "{file_refs} $prompt{suffix}" | '{gemini}' {model}--yolo -o {fmt}
+echo "{file_refs} $prompt{suffix}" | '{gemini}' {model}-o {fmt}
 "#,
             copy_section = copy_section,
             file_refs = file_refs,
@@ -812,7 +812,7 @@ fn build_ps_script_resume(gemini_path: &str, request: &GeminiRequest<'_>) -> Str
     format!(
         r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $prompt = Get-Content -Raw -Encoding UTF8 'prompt.txt'
-($prompt + "{suffix}") | & '{gemini}' {model}--resume latest --yolo -o {fmt}
+($prompt + "{suffix}") | & '{gemini}' {model}--resume latest -o {fmt}
 "#,
         gemini = gemini_path,
         model = model_opt,
@@ -843,7 +843,7 @@ fn build_shell_script_resume(gemini_path: &str, request: &GeminiRequest<'_>) -> 
     format!(
         r#"#!/bin/bash
 prompt=$(cat prompt.txt)
-echo "$prompt{suffix}" | '{gemini}' {model}--resume latest --yolo -o {fmt}
+echo "$prompt{suffix}" | '{gemini}' {model}--resume latest -o {fmt}
 "#,
         gemini = gemini_path,
         model = model_opt,
@@ -1181,7 +1181,7 @@ fn build_codex_ps_script(codex_path: &str, request: &AiRequest<'_>) -> String {
 
     format!(
         r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' exec -m {} -
+Get-Content -Raw -Encoding UTF8 'prompt.txt' | & '{}' exec --skip-git-repo-check -m {} -
 "#,
         codex_path, model
     )
@@ -1195,7 +1195,7 @@ fn build_codex_shell_script(codex_path: &str, request: &AiRequest<'_>) -> String
 
     format!(
         r#"#!/bin/bash
-cat prompt.txt | '{}' exec -m {} -
+cat prompt.txt | '{}' exec --skip-git-repo-check -m {} -
 "#,
         codex_path, model
     )
