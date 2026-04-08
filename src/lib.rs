@@ -234,26 +234,18 @@ pub fn analyze_in_dir<P: AsRef<Path>>(
     files: &[P],
     options: AnalyzeOptions,
 ) -> Result<String> {
-    // Copy files to work directory
-    let mut file_names = Vec::new();
+    // Use absolute paths directly instead of copying files
+    let mut file_paths = Vec::new();
     for file in files {
-        let file_path = file.as_ref();
-        let file_name = file_path
-            .file_name()
-            .ok_or_else(|| Error::InvalidPath(file_path.to_path_buf()))?
-            .to_string_lossy()
-            .to_string();
-
-        let dest = work_dir.join(&file_name);
-        std::fs::copy(file_path, &dest)?;
-        file_names.push(file_name);
+        let path = std::fs::canonicalize(file.as_ref())?;
+        file_paths.push(path.to_string_lossy().to_string());
     }
 
     let partial_json_ref = options.partial_json.as_deref();
     let request = AiRequest {
         prompt,
         model: &options.model,
-        files: Some(&file_names),
+        files: Some(&file_paths),
         output_format: options.output_format,
         backend: options.backend,
         partial_json: partial_json_ref,

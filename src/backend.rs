@@ -11,6 +11,8 @@ pub enum UsageMode {
     /// 時間ベース使用量制限（OAuth認証、期間内の無料枠）
     #[default]
     TimeBasedQuota,
+    /// 常駐エージェント（deckpilot経由）
+    Resident,
 }
 
 impl std::fmt::Display for UsageMode {
@@ -18,6 +20,7 @@ impl std::fmt::Display for UsageMode {
         match self {
             UsageMode::PayPerUse => write!(f, "従量課金 (PayPerUse)"),
             UsageMode::TimeBasedQuota => write!(f, "時間ベース使用量制限 (TimeBasedQuota)"),
+            UsageMode::Resident => write!(f, "常駐エージェント (Resident)"),
         }
     }
 }
