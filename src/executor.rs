@@ -446,17 +446,9 @@ pub(crate) fn run_ai_resume(
 
         let full_prompt = format!("{}{}", request.prompt, json_suffix);
         
+        let ps_cmd = build_start_process_cmd(&cli_path, model, &full_prompt, &["--resume", "latest"]);
         let mut cmd = Command::new("powershell");
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Start-Process -FilePath '{}' -ArgumentList '-m {} -p \"{}\" --resume latest -o text' -Wait -NoNewWindow",
-                cli_path, model, full_prompt.replace('"', "\\\"")
-            ),
-        ]);
-        
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
         cmd.current_dir(work_dir);
 
         #[cfg(target_os = "windows")]
@@ -569,6 +561,37 @@ fn run_deckpilot_windows(
     execute_command(cmd, work_dir)
 }
 
+/// Build a PowerShell `Start-Process` command that passes arguments as an array.
+///
+/// Using `-ArgumentList @('a','b',...)` avoids the backtick-in-single-quote escaping
+/// problem where `` `" `` inside a single-quoted string is treated literally by
+/// PowerShell, causing the child process to receive mangled argument text.
+///
+/// `extra_args` are appended after `-m <model> -p <prompt>`.
+fn build_start_process_cmd(cli_path: &str, model: &str, prompt: &str, extra_args: &[&str]) -> String {
+    // Escape single quotes in each value for PowerShell single-quoted strings.
+    let esc = |s: &str| s.replace('\'', "''");
+
+    let mut arg_items: Vec<String> = vec![
+        format!("'-m'"),
+        format!("'{}'", esc(model)),
+        format!("'-p'"),
+        format!("'{}'", esc(prompt)),
+    ];
+    for a in extra_args {
+        arg_items.push(format!("'{}'", esc(a)));
+    }
+    // Always request text output
+    arg_items.push("'-o'".to_string());
+    arg_items.push("'text'".to_string());
+
+    format!(
+        "Start-Process -FilePath '{}' -ArgumentList @({}) -Wait -NoNewWindow",
+        esc(cli_path),
+        arg_items.join(","),
+    )
+}
+
 /// Run Gemini CLI on Windows using PowerShell
 fn run_gemini_windows(
     work_dir: &Path,
@@ -600,17 +623,9 @@ fn run_gemini_windows(
 
     let full_prompt = format!("{} {}{}", file_refs, request.prompt, json_suffix);
     
+    let ps_cmd = build_start_process_cmd(gemini_path, model, &full_prompt, &[]);
     let mut cmd = Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!(
-            "Start-Process -FilePath '{}' -ArgumentList '-m {} -p \"{}\" -o text' -Wait -NoNewWindow",
-            gemini_path, model, full_prompt.replace('"', "\\\"")
-        ),
-    ]);
-    
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
     cmd.current_dir(work_dir);
 
     #[cfg(target_os = "windows")]
@@ -752,7 +767,7 @@ fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
 
 /// Build PowerShell script for Windows
 fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
-    let gemini_path = gemini_path.replace('\'', "''");
+    let gemini_path_esc = gemini_path.replace('\'', "''");
     // Always use text output for Gemini CLI - json output includes session metadata
     let output_format = "text";
 
@@ -764,39 +779,44 @@ fn build_ps_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String {
     };
     let model_opt = format!("-m {} ", model);
 
+    // Build JSON suffix based on partial_json or output_format
+    let json_suffix = if let Some(partial) = request.partial_json {
+        format!(" Fill in the null values in this JSON based on the image: {}", partial)
+    } else if request.output_format == OutputFormat::Json {
+        " Respond with ONLY the JSON object.".to_string()
+    } else {
+        String::new()
+    };
+
     if let Some(files) = request.files {
-        let file_refs = files.iter()
-            .map(|f| format!("@{}", f.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Build JSON suffix based on partial_json or output_format
-        let json_suffix = if let Some(partial) = request.partial_json {
-            format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "`\""))
-        } else if request.output_format == OutputFormat::Json {
-            " Respond with ONLY the JSON object.".to_string()
-        } else {
-            String::new()
-        };
-
-        // Combine @file refs + prompt into -p flag directly.
-        // This is more reliable for non-interactive execution than stdin piping.
+        // Copy each file to a neutral name (image_0.jpg, image_1.jpg, ...) to prevent
+        // filename hints leaking to the AI model.
+        // Gemini CLI v0.27.0 rejects -p when stdin is piped, so pipe everything via stdin.
+        let mut copy_lines = String::new();
+        let mut neutral_refs = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let ext = std::path::Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+            let neutral = format!("image_{}.{}", i, ext);
+            let src_esc = f.replace('\'', "''");
+            copy_lines.push_str(&format!("Copy-Item '{}' '{}'\n", src_esc, neutral));
+            neutral_refs.push(format!("@{}", neutral));
+        }
+        let file_refs = neutral_refs.join(" ");
         let full_prompt = format!("{} {}{}", file_refs, request.prompt, json_suffix);
-        let escaped_prompt = full_prompt.replace('\'', "''");
+        let prompt_esc = full_prompt.replace('\'', "''");
 
         format!(
-            r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-& '{}' {}-p '{}' -o {}
-"#,
-            gemini_path, model_opt, escaped_prompt, output_format
+            "$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8\n{}'{}' | & '{}' {}-o {}\n",
+            copy_lines, prompt_esc, gemini_path_esc, model_opt, output_format
         )
     } else {
-        let escaped_prompt = request.prompt.replace('\'', "''");
+        // No files: pipe prompt.txt content through stdin
         format!(
-            r#"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
-& '{}' {}-p '{}' -o {}
-"#,
-            gemini_path, model_opt, escaped_prompt, output_format
+            "$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8\nGet-Content 'prompt.txt' | & '{}' {}-o {}\n",
+            gemini_path_esc, model_opt, output_format
         )
     }
 }
@@ -814,29 +834,38 @@ fn build_shell_script(gemini_path: &str, request: &GeminiRequest<'_>) -> String 
     };
     let model_opt = format!("-m {} ", model);
 
+    // Build JSON suffix based on partial_json or output_format
+    let json_suffix = if let Some(partial) = request.partial_json {
+        format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "\\\""))
+    } else if request.output_format == OutputFormat::Json {
+        " Respond with ONLY the JSON object.".to_string()
+    } else {
+        String::new()
+    };
+
     if let Some(files) = request.files {
-        let file_refs = files.iter()
-            .map(|f| format!("@{}", f.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Build JSON suffix based on partial_json or output_format
-        let json_suffix = if let Some(partial) = request.partial_json {
-            format!(" Fill in the null values in this JSON based on the image: {}", partial.replace('"', "\\\""))
-        } else if request.output_format == OutputFormat::Json {
-            " Respond with ONLY the JSON object.".to_string()
-        } else {
-            String::new()
-        };
-
+        // Copy each file to a neutral name (image_0.jpg, image_1.jpg, ...) to prevent
+        // filename hints leaking to the AI model.
+        // Gemini CLI v0.27.0 rejects -p when stdin is piped, so pipe everything via echo.
+        let mut copy_lines = String::new();
+        let mut neutral_refs = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let ext = std::path::Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+            let neutral = format!("image_{}.{}", i, ext);
+            let src_esc = f.replace('\'', "'\\''");
+            copy_lines.push_str(&format!("cp '{}' '{}'\n", src_esc, neutral));
+            neutral_refs.push(format!("@{}", neutral));
+        }
+        let file_refs = neutral_refs.join(" ");
         let full_prompt = format!("{} {}{}", file_refs, request.prompt, json_suffix);
-        let escaped_prompt = full_prompt.replace('\'', "'\\''");
+        let prompt_esc = full_prompt.replace('\'', "'\\''");
 
         format!(
-            r#"#!/bin/bash
-'{}' {}-p '{}' -o {}
-"#,
-            gemini_path, model_opt, escaped_prompt, output_format
+            "#!/bin/bash\n{}echo '{}' | '{}' {}-o {}\n",
+            copy_lines, prompt_esc, gemini_path.replace('\'', "'\\''"), model_opt, output_format
         )
     } else {
         let escaped_prompt = request.prompt.replace('\'', "'\\''");
@@ -1871,5 +1900,81 @@ mod tests {
             "Resume PS script with Text format must NOT contain JSON suffix, got: {}",
             script
         );
+    }
+
+    // --- build_start_process_cmd tests ---
+
+    #[test]
+    fn test_build_start_process_cmd_basic() {
+        let cmd = build_start_process_cmd(
+            "C:/tools/gemini.cmd",
+            "gemini-flash",
+            "describe this image",
+            &[],
+        );
+        // Must use array form
+        assert!(cmd.contains("-ArgumentList @("), "must use array form: {}", cmd);
+        // Must contain each argument as a separate quoted element
+        assert!(cmd.contains("'-m'"), "must have '-m': {}", cmd);
+        assert!(cmd.contains("'gemini-flash'"), "must have model: {}", cmd);
+        assert!(cmd.contains("'-p'"), "must have '-p': {}", cmd);
+        assert!(cmd.contains("'describe this image'"), "must have prompt: {}", cmd);
+        assert!(cmd.contains("'-o'"), "must have '-o': {}", cmd);
+        assert!(cmd.contains("'text'"), "must have 'text': {}", cmd);
+        // Must NOT use backtick escaping
+        assert!(!cmd.contains('`'), "must not contain backtick: {}", cmd);
+    }
+
+    #[test]
+    fn test_build_start_process_cmd_resume_extra_args() {
+        let cmd = build_start_process_cmd(
+            "gemini.cmd",
+            "gemini-flash",
+            "continue",
+            &["--resume", "latest"],
+        );
+        assert!(cmd.contains("'--resume'"), "must have --resume: {}", cmd);
+        assert!(cmd.contains("'latest'"), "must have latest: {}", cmd);
+    }
+
+    #[test]
+    fn test_build_start_process_cmd_single_quote_in_prompt() {
+        // Single quotes inside prompt must be doubled (PowerShell escaping)
+        let cmd = build_start_process_cmd(
+            "gemini.cmd",
+            "gemini-flash",
+            "it's a truck",
+            &[],
+        );
+        // "it's" becomes "it''s" inside the single-quoted PS string
+        assert!(cmd.contains("it''s"), "single quote must be doubled: {}", cmd);
+        assert!(!cmd.contains('`'), "must not contain backtick: {}", cmd);
+    }
+
+    #[test]
+    fn test_build_start_process_cmd_double_quote_in_prompt() {
+        // Double quotes should pass through without backtick mangling
+        let cmd = build_start_process_cmd(
+            "gemini.cmd",
+            "gemini-flash",
+            r#"say "hello""#,
+            &[],
+        );
+        // Double quote is preserved as-is inside PS array element single-quoted string
+        assert!(cmd.contains(r#"say "hello""#), "double quote must be preserved: {}", cmd);
+        assert!(!cmd.contains('`'), "must not contain backtick: {}", cmd);
+    }
+
+    #[test]
+    fn test_build_start_process_cmd_no_extra_args_produces_correct_arg_count() {
+        let cmd = build_start_process_cmd("g.cmd", "model", "prompt", &[]);
+        // Expected: '-m','model','-p','prompt','-o','text'  => 6 elements
+        let inside = cmd
+            .split("@(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .unwrap_or("");
+        let count = inside.split(',').count();
+        assert_eq!(count, 6, "expected 6 array elements, got {}: {}", count, cmd);
     }
 }
