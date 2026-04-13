@@ -430,31 +430,8 @@ pub(crate) fn run_ai_resume(
     fs::write(&prompt_file, request.prompt)?;
 
     if cfg!(target_os = "windows") {
-        let model = if request.model.is_empty() {
-            "gemini-3-flash-preview"
-        } else {
-            request.model
-        };
-
-        let json_suffix = if let Some(partial) = request.partial_json {
-            format!(" Fill in the null values in this JSON based on the image: {}", partial)
-        } else if request.output_format == OutputFormat::Json {
-            " Respond with ONLY the JSON object.".to_string()
-        } else {
-            String::new()
-        };
-
-        let full_prompt = format!("{}{}", request.prompt, json_suffix);
-        
-        let ps_cmd = build_start_process_cmd(&cli_path, model, &full_prompt, &["--resume", "latest"]);
-        let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
-        cmd.current_dir(work_dir);
-
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-
-        let result = execute_command(cmd, work_dir);
+        let script = build_ps_script_resume(&cli_path, request);
+        let result = run_powershell_script(work_dir, "run_gemini_resume.ps1", &script);
         if let Some(path) = profile_path {
             let _ = write_profile(path, request, start.elapsed(), result.as_ref().err(), true);
         }
@@ -561,27 +538,43 @@ fn run_deckpilot_windows(
     execute_command(cmd, work_dir)
 }
 
+#[cfg(target_os = "windows")]
+fn run_powershell_script(work_dir: &Path, script_name: &str, script: &str) -> Result<String> {
+    let script_file = work_dir.join(script_name);
+    fs::write(&script_file, script)?;
+
+    let script_path = script_file.to_string_lossy().into_owned();
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script_path,
+    ]);
+    cmd.current_dir(work_dir);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    execute_command(cmd, work_dir)
+}
+
 /// Build a PowerShell `Start-Process` command that passes arguments as an array.
 ///
-/// Using `-ArgumentList @('a','b',...)` avoids the backtick-in-single-quote escaping
-/// problem where `` `" `` inside a single-quoted string is treated literally by
-/// PowerShell, causing the child process to receive mangled argument text.
-///
-/// `extra_args` are appended after `-m <model> -p <prompt>`.
+/// This is kept for regression tests that guard the previous Windows escaping bug.
+#[allow(dead_code)]
 fn build_start_process_cmd(cli_path: &str, model: &str, prompt: &str, extra_args: &[&str]) -> String {
-    // Escape single quotes in each value for PowerShell single-quoted strings.
     let esc = |s: &str| s.replace('\'', "''");
 
     let mut arg_items: Vec<String> = vec![
-        format!("'-m'"),
+        "'-m'".to_string(),
         format!("'{}'", esc(model)),
-        format!("'-p'"),
+        "'-p'".to_string(),
         format!("'{}'", esc(prompt)),
     ];
     for a in extra_args {
         arg_items.push(format!("'{}'", esc(a)));
     }
-    // Always request text output
     arg_items.push("'-o'".to_string());
     arg_items.push("'text'".to_string());
 
@@ -598,40 +591,8 @@ fn run_gemini_windows(
     gemini_path: &str,
     request: &GeminiRequest<'_>,
 ) -> Result<String> {
-    let model = if request.model.is_empty() {
-        "gemini-3-flash-preview"
-    } else {
-        request.model
-    };
-
-    let file_refs = if let Some(files) = request.files {
-        files.iter()
-            .map(|f| format!("@{}", f))
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        String::new()
-    };
-
-    let json_suffix = if let Some(partial) = request.partial_json {
-        format!(" Fill in the null values in this JSON based on the image: {}", partial)
-    } else if request.output_format == OutputFormat::Json {
-        " Respond with ONLY the JSON object.".to_string()
-    } else {
-        String::new()
-    };
-
-    let full_prompt = format!("{} {}{}", file_refs, request.prompt, json_suffix);
-    
-    let ps_cmd = build_start_process_cmd(gemini_path, model, &full_prompt, &[]);
-    let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
-    cmd.current_dir(work_dir);
-
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    execute_command(cmd, work_dir)
+    let script = build_ps_script(gemini_path, request);
+    run_powershell_script(work_dir, "run_gemini.ps1", &script)
 }
 
 /// Run Gemini CLI on Unix systems
@@ -658,9 +619,6 @@ fn run_gemini_unix(
 
     execute_command(cmd, work_dir)
 }
-
-/// Default timeout for CLI execution (180 seconds)
-const CLI_TIMEOUT_SECS: u64 = 180;
 
 /// Execute the command and process output
 fn execute_command(mut cmd: Command, work_dir: &Path) -> Result<String> {
@@ -952,28 +910,10 @@ fn run_claude_windows(
     // Build prompt with file contents if files are provided
     let full_prompt = build_claude_prompt(request)?;
 
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/c", claude_path]);
-    cmd.current_dir(work_dir);
-    cmd.stdin(std::process::Stdio::piped()); // We will write full_prompt to stdin
-
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    // execute_command needs to be aware of stdin if we use it this way,
-    // but for now, let's keep it simple and use a temporary file for claude too
-    // to keep using our existing execute_command without major changes.
     let prompt_file = work_dir.join("prompt.txt");
     fs::write(&prompt_file, &full_prompt)?;
-
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/c", &format!("type prompt.txt | \"{}\"", claude_path)]);
-    cmd.current_dir(work_dir);
-
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    execute_command(cmd, work_dir)
+    let script = build_claude_ps_script_stdin(claude_path, request);
+    run_powershell_script(work_dir, "run_claude.ps1", &script)
 }
 
 /// Run Claude CLI on Unix systems
@@ -1182,14 +1122,8 @@ fn run_codex_windows(
     let prompt_file = work_dir.join("prompt.txt");
     fs::write(&prompt_file, &full_prompt)?;
 
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/c", &format!("type prompt.txt | \"{}\" exec --skip-git-repo-check -m {} -", codex_path, request.model)]);
-    cmd.current_dir(work_dir);
-
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    execute_command(cmd, work_dir)
+    let script = build_codex_ps_script(codex_path, request);
+    run_powershell_script(work_dir, "run_codex.ps1", &script)
 }
 
 /// Run Codex CLI on Unix systems
