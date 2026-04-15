@@ -1,0 +1,17 @@
+# Go build output
+*.exe
+*.test
+*.out
+
+# Go workspace & vendored deps (kept off-repo)
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+/.omc/
